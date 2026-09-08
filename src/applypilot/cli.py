@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "apply":
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--run", action="store_true")
+            cmd.add_argument(
+                "--target-success", type=int,
+                help="stop after this many confirmed successes; --limit is the candidate ceiling",
+            )
         else:
             cmd.add_argument("--output", type=Path, help="private JSON plan output")
         cmd.add_argument("--preset", choices=PRESET_CHOICES)
@@ -397,10 +401,19 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run and not args.run:
             print("Choose --dry-run or --run", file=sys.stderr)
             return 2
+        if args.target_success is not None:
+            if args.dry_run:
+                print("--target-success requires --run", file=sys.stderr)
+                return 2
+            if args.target_success < 1 or args.target_success > limit:
+                print("--target-success must be positive and no greater than --limit", file=sys.stderr)
+                return 2
         run_id = uuid.uuid4().hex
         if args.dry_run:
             return _run_dry(store, selected, run_id, account, args.input, limit)
-        return _run_apply(config, store, selected, run_id, account, args.input, limit)
+        return _run_apply(
+            config, store, selected, run_id, account, args.input, limit, args.target_success,
+        )
     if args.command == "inspect":
         ok, detail = validate_state(session_path)
         if not ok:
@@ -504,13 +517,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.pages is not None and args.pages < 1:
                 print("--pages must be positive", file=sys.stderr)
                 return 2
-            rows = sync_statuses(session_path, Store(config.db_path), account=account, max_pages=args.pages)
+            sync_store = Store(config.db_path)
+            rows = sync_statuses(session_path, sync_store, account=account, max_pages=args.pages)
+            reconciled = sync_store.reconcile_unknowns_from_negotiations(account)
         except SyncError as exc:
             print(f"sync: error ({exc})", file=sys.stderr)
             return 3
         output = args.output or _default_artifact(config, "reports", "json")
-        _write_private_json(output, {"account": account, "rows": rows})
+        _write_private_json(output, {"account": account, "rows": rows, "reconciled_unknown": reconciled})
         print(f"sync: {len(rows)} statuses; messages=disabled")
+        print(f"reconciled_unknown: {len(reconciled)}"
+              + (f" ({','.join(reconciled)})" if reconciled else ""))
         print(f"sync_report: {output}")
         return 0
     if args.command == "analytics":
@@ -570,7 +587,8 @@ def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
 
 
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
-               account: str, input_path: Path, requested_limit: int) -> int:
+               account: str, input_path: Path, requested_limit: int,
+               target_success: int | None = None) -> int:
     """Execute explicitly requested browser submissions with auditable stop conditions."""
     try:
         profile = _profile(config, effective_search(config.load_search(), None))
@@ -593,6 +611,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         from playwright.sync_api import sync_playwright
 
         from .autoapply import apply_one
+        from .negotiations import SyncError, sync_statuses
     except ImportError:
         print("browser support missing; install with: pip install -e '.[browser]'", file=sys.stderr)
         return 2
@@ -605,9 +624,11 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     timing = profile.get("apply", {}) or {}
     delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
     delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
+    confirmation_timeout = max(0.0, float(timing.get("confirmation_timeout_seconds", 15)))
     run_status = "completed"
     stop_reason = ""
     exit_code = 0
+    confirmed_successes = 0
     with store.run_lock():
         store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
         browser = None
@@ -643,13 +664,37 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         enabled=True, required=True,
                     )
                     item["llm_source"] = source
-                result = apply_one(page, item, str(item.get("resume", "")).strip(), cover_letter)
-                store.record(item, result.status, result.note, run_id, account)
-                print(f"{item.get('id')}: {result.status} — {result.note}")
+                result = apply_one(
+                    page, item, str(item.get("resume", "")).strip(), cover_letter,
+                    confirmation_timeout_seconds=confirmation_timeout,
+                )
                 if result.status == "unknown":
-                    run_status = "stopped_unknown"
-                    stop_reason = f"unknown result for vacancy {item.get('id')}"
-                    exit_code = 3
+                    store.record(item, result.status, result.note, run_id, account)
+                    try:
+                        save_state(state_path, context.storage_state())
+                        sync_statuses(state_path, store, account=account)
+                        reconciled = store.reconcile_unknowns_from_negotiations(account)
+                    except SyncError as exc:
+                        LOGGER.warning("Could not confirm vacancy %s through sync: %s", item.get("id"), exc)
+                        reconciled = []
+                    vacancy_id = str(item.get("id", ""))
+                    if vacancy_id in reconciled:
+                        print(f"{vacancy_id}: success — confirmed by HH negotiations")
+                        confirmed_successes += 1
+                    else:
+                        print(f"{vacancy_id}: unknown — {result.note}")
+                        run_status = "stopped_unknown"
+                        stop_reason = f"unknown result for vacancy {vacancy_id}"
+                        exit_code = 3
+                        break
+                else:
+                    store.record(item, result.status, result.note, run_id, account)
+                    print(f"{item.get('id')}: {result.status} — {result.note}")
+                    if result.status == "success":
+                        confirmed_successes += 1
+                if target_success is not None and confirmed_successes >= target_success:
+                    run_status = "target_reached"
+                    stop_reason = f"confirmed success target reached ({confirmed_successes})"
                     break
                 if index < len(selected) and delay_max:
                     time.sleep(random.uniform(delay_min, delay_max))
@@ -684,6 +729,12 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         playwright.stop()
                     except Exception:
                         LOGGER.debug("Could not stop Playwright", exc_info=True)
+            if target_success is not None and run_status == "completed":
+                run_status = "completed_shortfall"
+                stop_reason = (
+                    f"confirmed success target not reached ({confirmed_successes}/{target_success})"
+                )
+                exit_code = 4
             store.finish_run(run_id, run_status, stop_reason)
     _print_run_summary(store, run_id)
     return exit_code

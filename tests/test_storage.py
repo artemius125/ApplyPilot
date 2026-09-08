@@ -87,3 +87,22 @@ def test_run_items_keep_the_exact_dry_run_list(tmp_path):
     assert summary is not None
     assert summary["run"]["status"] == "completed"
     assert summary["counts"] == {"prepared": 1}
+
+
+def test_negotiation_reconciles_unknown_without_replaying_the_run(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    items = [{"id": "1", "name": "A"}, {"id": "2", "name": "B"}]
+    store.start_run("live", "account", "apply", tmp_path / "input.json", 2, items)
+    store.record(items[0], "unknown", "submission not confirmed", "live", "account")
+    store.finish_run("live", "stopped_unknown", "unknown result for vacancy 1")
+    store.replace_negotiation_statuses(
+        [{"vacancy_id": "1", "status": "not_viewed"}], "account"
+    )
+
+    assert store.reconcile_unknowns_from_negotiations("account") == ["1"]
+    assert store.statuses("account")["1"] == "success"
+    summary = store.run_summary("live")
+    assert summary is not None
+    assert summary["run"]["status"] == "stopped_reconciled"
+    assert summary["counts"] == {"prepared": 1, "success": 1}
+    assert store.reconcile_unknowns_from_negotiations("account") == []

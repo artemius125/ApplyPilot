@@ -151,15 +151,19 @@ read-only контекстом:
 # Review the generated private plan, run ID, resumes and inspection results first.
 # Set reviewed = true in private/config/profile.toml only after that review.
 .venv/bin/python -m applypilot apply --input private/data/snapshots/FILE.json \
-  --preset ai-agents-llmops --run --limit 10
+  --preset ai-agents-llmops --run --limit 30 --target-success 10
 .venv/bin/python -m applypilot sync  # all negotiation pages; use --pages N to set a ceiling
 .venv/bin/python -m applypilot analytics
 ```
 
 During `apply --run`, each candidate is logged before and after a potential submission. An
-external ATS, CAPTCHA, screening question or ambiguous resume becomes `needs_manual`; the
-first `unknown` result stops the entire run without a retry. The run record reports its exact
-`run_id` and per-status counts.
+external ATS, CAPTCHA, screening question or ambiguous resume becomes `needs_manual`. After
+the final action ApplyPilot waits for the configured confirmation deadline and, if the page is
+still ambiguous, checks the read-only HH negotiations ledger. A matching vacancy reconciles to
+`success`; only an unconfirmed `unknown` stops the run without a retry. The run record reports
+its exact `run_id` and per-status counts.
+`--limit` задаёт потолок кандидатов, а `--target-success` — число подтверждённых откликов:
+`needs_manual` и `already_applied` не засчитываются, вместо них берутся следующие кандидаты.
 
 ## История и LLM
 
@@ -169,7 +173,7 @@ first `unknown` result stops the entire run without a retry. The run record repo
 .venv/bin/python -m applypilot llm preview --input private/data/snapshots/example.json --id 123
 ```
 
-SQLite хранит запуски, точные списки кандидатов, попытки, события и атомарные резервы бюджета. Дедупликация идёт по приватному ключу аккаунта и ID вакансии: блокируются только `success`, `already_applied`, `unknown` и незавершённый `submitting`; старые `skipped` не исключают свежую вакансию. Лимиты берутся из приватного профиля, без скрытого hard cap. Старый `timeout` импортируется как `unknown`; CSV остаётся форматом импорта/экспорта.
+SQLite хранит запуски, точные списки кандидатов, попытки, события и атомарные резервы бюджета. Дедупликация идёт по приватному ключу аккаунта и ID вакансии: блокируются только `success`, `already_applied`, неподтверждённый `unknown` и незавершённый `submitting`; старые `skipped` не исключают свежую вакансию. `sync` автоматически переводит `unknown` в `success`, когда тот же vacancy ID присутствует в HH negotiations. Лимиты берутся из приватного профиля, без скрытого hard cap. Старый `timeout` импортируется как `unknown`; CSV остаётся форматом импорта/экспорта.
 
 LLM выключен по умолчанию. При включении нужно явно указать модель и ключ OpenRouter; модель проверяется по каталогу, автоматического перехода на платную модель нет. Максимум две попытки и 30 секунд, кэш зависит от ID, названия и описания вакансии, профиля, модели и версии промпта. В провайдер отправляется только минимальный набор сведений профиля.
 

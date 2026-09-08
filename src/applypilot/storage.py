@@ -388,6 +388,51 @@ class Store:
                      row.get("company", ""), row.get("updated_at", ""), fetched_at),
                 )
 
+    def reconcile_unknowns_from_negotiations(self, account: str = "default") -> list[str]:
+        """Promote ambiguous submissions proven by HH's negotiation ledger."""
+        timestamp = now()
+        reconciled: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT a.vacancy_id,a.run_id,n.status AS negotiation_status
+                FROM attempts a JOIN negotiation_statuses n
+                  ON n.account=a.account AND n.vacancy_id=a.vacancy_id
+                WHERE a.account=? AND a.status='unknown' AND n.status<>''""",
+                (account,),
+            ).fetchall()
+            for row in rows:
+                vacancy_id = row["vacancy_id"]
+                run_id = row["run_id"]
+                note = f"confirmed by HH negotiations ({row['negotiation_status']})"
+                conn.execute(
+                    """UPDATE attempts SET status='success',note=?,updated_at=?
+                    WHERE account=? AND vacancy_id=? AND status='unknown'""",
+                    (note, timestamp, account, vacancy_id),
+                )
+                conn.execute(
+                    "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) VALUES(?,?,?,?,?,?)",
+                    (account, vacancy_id, "success", note, run_id, timestamp),
+                )
+                if run_id:
+                    conn.execute(
+                        """UPDATE run_items SET status='success',note=?,updated_at=?
+                        WHERE run_id=? AND vacancy_id=? AND status='unknown'""",
+                        (note, timestamp, run_id, vacancy_id),
+                    )
+                    remaining = conn.execute(
+                        "SELECT COUNT(*) FROM run_items WHERE run_id=? AND status='prepared'",
+                        (run_id,),
+                    ).fetchone()[0]
+                    stop_note = (f"unknown vacancy {vacancy_id} confirmed by negotiations; "
+                                 f"unprocessed candidates={remaining}")
+                    conn.execute(
+                        """UPDATE runs SET status='stopped_reconciled',stop_reason=?
+                        WHERE run_id=? AND status='stopped_unknown'""",
+                        (stop_note, run_id),
+                    )
+                reconciled.append(vacancy_id)
+        return reconciled
+
     def latest_sync(self, account: str = "default") -> dict[str, Any] | None:
         if not self.path.exists():
             return None

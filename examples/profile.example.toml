@@ -12,6 +12,7 @@ per_day = 20
 [apply]
 delay_min_seconds = 5
 delay_max_seconds = 12
+confirmation_timeout_seconds = 15
 
 [llm]
 enabled = false
