@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,18 @@ def allowed_hh_url(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.hostname or ""
     return parsed.scheme == "https" and (host == "hh.ru" or host.endswith(".hh.ru"))
+
+
+def has_screening_form(page) -> bool:
+    """Detect the response-dialog form, not the public vacancy FAQ."""
+    for selector in ("[data-qa='task-body']", ".vacancy-response-popup__screening"):
+        try:
+            if page.locator(selector).first.is_visible(timeout=2000):
+                return True
+        except Exception:
+            LOGGER.debug("Could not inspect response-dialog selector %s", selector, exc_info=True)
+            continue
+    return False
 
 
 def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bool = False) -> ApplyResult:
@@ -35,8 +50,6 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("already_applied", "HH reports an existing application")
         if "captcha" in body:
             return ApplyResult("needs_manual", "CAPTCHA detected")
-        if page.locator('[data-qa*="screening"], [data-qa*="question"]').count() > 0:
-            return ApplyResult("needs_manual", "screening questions require manual review")
         links = page.locator('[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link"]')
         if links.count() == 0:
             return ApplyResult("needs_manual", "application button not found")
@@ -57,7 +70,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("already_applied", "HH reports an existing application")
         if "captcha" in body:
             return ApplyResult("needs_manual", "CAPTCHA detected")
-        if page.locator('[data-qa*="screening"], [data-qa*="question"]').count() > 0:
+        if has_screening_form(page):
             return ApplyResult("needs_manual", "screening questions require manual review")
         dialog_controls = page.locator(
             '[data-qa="resume-title"], [data-qa="vacancy-response-letter-input"], '
@@ -74,7 +87,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             if field.count() != 1 or not field.is_visible(timeout=2000):
                 return ApplyResult("needs_manual", "cover letter field is missing")
             field.fill(cover_letter)
-        if page.locator('[data-qa*="screening"], [data-qa*="question"]').count() > 0:
+        if has_screening_form(page):
             return ApplyResult("needs_manual", "screening questions require manual review")
         submit = page.locator('[data-qa="vacancy-response-submit-popup"]').first
         if not submit.is_visible(timeout=8000):

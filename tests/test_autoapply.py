@@ -28,8 +28,8 @@ class _Locator:
             return 1 if self.page.dialog else 0
         if "vacancy-response-submit-popup" in selector:
             return 1 if self.page.dialog else 0
-        if "screening" in selector or "question" in selector:
-            return self.page.question_count
+        if "task-body" in selector or "vacancy-response-popup__screening" in selector:
+            return self.page.question_count if self.page.dialog else 0
         return 1
 
     def is_visible(self, timeout=None):
@@ -146,6 +146,18 @@ def test_confirmed_two_step_submission_has_one_submit():
     assert sum("vacancy-response-link" in selector for selector in page.clicks) == 1
     assert sum("submit-popup" in selector for selector in page.clicks) == 1
     assert page.fills == ["Здравствуйте"]
+
+
+def test_screening_form_in_the_response_dialog_stops_before_submit():
+    page = _Page()
+    page.question_count = 1
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "needs_manual"
+    assert result.note == "screening questions require manual review"
+    assert sum("vacancy-response-link" in selector for selector in page.clicks) == 1
+    assert not any("submit-popup" in selector for selector in page.clicks)
 
 
 def test_external_navigation_is_manual_not_a_substring_match():

@@ -45,6 +45,16 @@ def test_reservation_uses_one_budget_unit_and_deduplicates(tmp_path):
     assert store.statuses()["1"] == "success"
 
 
+def test_manual_outcome_releases_transient_reservation_for_a_future_run(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    item = {"id": "1", "name": "A"}
+
+    assert store.reserve(item, "first", per_run=1, per_day=2)[0]
+    store.record(item, "needs_manual", run_id="first")
+
+    assert store.reserve(item, "second", per_run=1, per_day=2)[0]
+
+
 def test_missing_timestamp_import_is_idempotent(tmp_path):
     path = tmp_path / "apply_log.csv"
     path.write_text("vacancy_id,status\n1,timeout\n", encoding="utf-8")

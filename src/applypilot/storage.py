@@ -277,6 +277,11 @@ class Store:
                     "UPDATE run_items SET status=?,note=?,updated_at=? WHERE run_id=? AND vacancy_id=?",
                     (status, note, timestamp, run_id, vacancy_id),
                 )
+            if status != "submitting":
+                conn.execute(
+                    "DELETE FROM reservations WHERE account=? AND vacancy_id=?",
+                    (account, vacancy_id),
+                )
 
     def reserve(self, item: dict[str, Any], run_id: str, per_run: int, per_day: int,
                 account: str = "default") -> tuple[bool, str]:
@@ -290,14 +295,24 @@ class Store:
             existing = conn.execute(
                 "SELECT status FROM attempts WHERE account=? AND vacancy_id=?", (account, vacancy_id)
             ).fetchone()
+            if existing and existing["status"] != "submitting":
+                # A completed outcome is protected by ``attempts`` where required;
+                # its transient in-flight lock must never block a future manual retry.
+                conn.execute(
+                    "DELETE FROM reservations WHERE account=? AND vacancy_id=?",
+                    (account, vacancy_id),
+                )
             if existing and existing["status"] in BLOCKED_STATUSES:
                 return False, f"already handled ({existing['status']})"
             day_prefix = datetime.now(UTC).date().isoformat()
             run_count = conn.execute(
-                "SELECT COUNT(*) FROM reservations WHERE account=? AND run_id=?", (account, run_id)
+                """SELECT COUNT(DISTINCT vacancy_id) FROM events
+                WHERE account=? AND run_id=? AND status='submitting'""",
+                (account, run_id),
             ).fetchone()[0]
             day_count = conn.execute(
-                "SELECT COUNT(*) FROM reservations WHERE account=? AND created_at LIKE ?",
+                """SELECT COUNT(DISTINCT vacancy_id) FROM events
+                WHERE account=? AND status='submitting' AND created_at LIKE ?""",
                 (account, f"{day_prefix}%"),
             ).fetchone()[0]
             if run_count >= per_run:
