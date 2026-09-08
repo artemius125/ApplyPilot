@@ -10,8 +10,12 @@ def test_legacy_import_is_idempotent(tmp_path):
         writer.writeheader()
         writer.writerow({"vacancy_id": "1", "name": "A", "status": "timeout", "timestamp": "2026-01-01"})
     store = Store(tmp_path / "state.sqlite3")
-    assert store.import_csv(path) == 1
-    assert store.import_csv(path) == 1
+    first = store.import_csv(path)
+    second = store.import_csv(path)
+    assert first.logical_rows == 1
+    assert first.events_added == 1
+    assert second.already_imported is True
+    assert second.events_added == 0
     assert store.statuses()["1"] == "unknown"
     assert store.count()["unknown"] == 1
     with store.connect() as conn:
@@ -49,3 +53,27 @@ def test_missing_timestamp_import_is_idempotent(tmp_path):
     store.import_csv(path)
     with store.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+
+
+def test_blocked_ids_exclude_only_terminal_or_ambiguous_outcomes(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    for vacancy_id, status in {
+        "success": "success", "already": "already_applied", "unknown": "unknown",
+        "skipped": "skipped", "manual": "needs_manual", "failed": "failed_before_submit",
+    }.items():
+        store.record({"id": vacancy_id}, status)
+
+    assert store.blocked_ids() == {"success", "already", "unknown"}
+
+
+def test_run_items_keep_the_exact_dry_run_list(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    item = {"id": "1", "name": "A", "resume": "Resume"}
+    store.start_run("dry", "account", "dry-run", tmp_path / "input.json", 10, [item])
+    store.mark_run_item("dry", "1", "prepared", "would apply")
+    store.finish_run("dry", "completed")
+
+    summary = store.run_summary("dry")
+    assert summary is not None
+    assert summary["run"]["status"] == "completed"
+    assert summary["counts"] == {"prepared": 1}

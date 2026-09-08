@@ -57,7 +57,7 @@ def _parse_topics(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def sync_statuses(state_path: Path, store: Store, account: str = "default",
-                  max_pages: int = 1, timeout: float = 20.0) -> list[dict[str, Any]]:
+                  max_pages: int | None = None, timeout: float = 20.0) -> list[dict[str, Any]]:
     """Read negotiation statuses only; messages and chat endpoints are excluded."""
     try:
         client = requests.Session()
@@ -65,7 +65,9 @@ def sync_statuses(state_path: Path, store: Store, account: str = "default",
             client.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ".hh.ru"),
                               path=cookie.get("path", "/"))
         rows: list[dict[str, Any]] = []
-        for page in range(max(1, max_pages)):
+        page = 0
+        seen_pages: set[tuple[str, ...]] = set()
+        while max_pages is None or page < max_pages:
             response = client.get("https://hh.ru/applicant/negotiations", params={"page": page},
                                   timeout=timeout, headers={"User-Agent": "ApplyPilot/0.1"})
             if response.status_code in {403, 429}:
@@ -78,17 +80,22 @@ def sync_statuses(state_path: Path, store: Store, account: str = "default",
                     raise SyncError("CAPTCHA detected")
                 raise SyncError("HH-Lux-InitialState not found")
             page_rows = _parse_topics(state)
+            page_ids = tuple(row["vacancy_id"] for row in page_rows)
+            if page_ids and page_ids in seen_pages:
+                raise SyncError("repeated negotiation page; stopping without guessing pagination")
+            seen_pages.add(page_ids)
             rows.extend(page_rows)
             if not page_rows:
                 break
+            page += 1
         store.replace_negotiation_statuses(rows, account)
-        store.save_sync_snapshot("hh.ru", "ok" if rows else "empty", len(rows))
+        store.save_sync_snapshot("hh.ru", "ok" if rows else "empty", len(rows), account=account)
         return rows
     except (requests.RequestException, OSError, json.JSONDecodeError) as exc:
-        store.save_sync_snapshot("hh.ru", "network_error", 0, str(exc)[:240])
+        store.save_sync_snapshot("hh.ru", "network_error", 0, str(exc)[:240], account=account)
         raise SyncError(f"network error: {exc}") from exc
     except SyncError as exc:
-        store.save_sync_snapshot("hh.ru", "error", 0, str(exc))
+        store.save_sync_snapshot("hh.ru", "error", 0, str(exc), account=account)
         raise
 
 

@@ -4,7 +4,7 @@
 
 ## Границы безопасности
 
-`plan` и `apply --dry-run` читают входной JSON и существующий SQLite-журнал, но не создают базу, не меняют сессию, не вызывают LLM и не открывают браузер. `inspect` только читает DOM в отдельном Playwright-контексте: максимум три вакансии, без `click`, `fill`, `submit` и изменяющего JavaScript. Реальная отправка возможна только через явно указанный `apply --run`; она не проверена в рамках этой миграции.
+`plan` читает входной JSON и существующий SQLite-журнал и сохраняет приватный JSON-план. `apply --dry-run` не открывает браузер, не меняет сессию и не вызывает LLM, но записывает локальный `run_id` и точный список кандидатов для аудита. `inspect` только читает DOM в отдельном Playwright-контексте, без `click`, `fill`, `submit` и изменяющего JavaScript. Реальная отправка возможна только через явно указанный `apply --run`.
 
 Неопределённый результат после потенциальной отправки получает `unknown`. Такой статус блокирует автоматический повтор и требует явного подтверждения через `history reconcile`.
 
@@ -66,7 +66,8 @@ AI Agents, LLM, RAG и LLMOps: QA, security, продажи и обучение 
 
 ```bash
 .venv/bin/python -m applypilot scan --preset ai-agents-llmops \
-  --area 113 --add-query "LLM Platform Engineer" --pages 1 --days 7 --details-limit 40
+  --area 113 --add-query "LLM Platform Engineer" --pages 1 --days 7 \
+  --request-budget 100 --details-limit 100
 ```
 
 Поиск проходит по всем явно заданным регионам, запросам и страницам, сохраняет источники
@@ -75,7 +76,7 @@ AI Agents, LLM, RAG и LLMOps: QA, security, продажи и обучение 
 в TOML; значения CLI имеют приоритет. `benchmark` проверяет базовый уровень шума на
 обезличенных AI/LLM, ML, Python и Go примерах.
 
-`scan` использует HTML и `HH-Lux-InitialState`, а не OAuth API. Статусы итогового
+`scan` использует HTML и `HH-Lux-InitialState`, а не OAuth API. Бюджет поисковых HTTP-запросов и число загружаемых описаний задаются через TOML или `--request-budget`/`--details-limit`; в коде нет скрытого потолка для этих значений. Статусы итогового
 снимка — `ok`, `empty`, `truncated` и `partial`; ошибки отдельных сегментов (например,
 403/429, CAPTCHA, сеть или отсутствующая структура HTML) сохраняются отдельно. Ошибочная
 пустая выдача не заменяет последний успешный снимок.
@@ -114,6 +115,52 @@ HTML-review разделяет top, остальные подтверждённ�
 
 `session check` классифицирует формат файла, подтверждённый вход, истёкшую сессию, сетевую ошибку и неизвестную разметку. `login` запускает только собственный Playwright-браузер и сохраняет storage state атомарно с ограничением прав, если это поддерживает файловая система.
 
+## Сессия HH и контролируемый запуск
+
+Cookies никогда не копируются в репозиторий, `.env`, отчёт или командную строку. Один раз
+установите браузер в приватный каталог и войдите в открывшемся изолированном окне:
+
+```bash
+export PLAYWRIGHT_BROWSERS_PATH="$PWD/private/browsers"
+.venv/bin/python -m playwright install chromium
+.venv/bin/python -m applypilot login
+.venv/bin/python -m applypilot session check
+```
+
+После ручного входа Playwright сохраняет state только в `private/data/hh_session.json`.
+Не подменяйте этот файл cookies из браузерных расширений и не добавляйте его в Git. Перед
+любым запуском проверьте реальные доступные резюме и страницы кандидатов отдельным
+read-only контекстом:
+
+```bash
+.venv/bin/python -m applypilot inspect --resumes
+.venv/bin/python -m applypilot inspect --input private/data/snapshots/FILE.json \
+  --selected --limit 15 --preset ai-agents-llmops
+```
+
+Полный безопасный цикл создаёт приватные артефакты и не отправляет отклики до последней
+команды:
+
+```bash
+.venv/bin/python -m applypilot history import \
+  --source private/archive/operation_exit/TOOLS/results/apply_log.csv
+.venv/bin/python -m applypilot plan --input private/data/snapshots/FILE.json \
+  --preset ai-agents-llmops --limit 15
+.venv/bin/python -m applypilot apply --input private/data/snapshots/FILE.json \
+  --preset ai-agents-llmops --dry-run --limit 10
+# Review the generated private plan, run ID, resumes and inspection results first.
+# Set reviewed = true in private/config/profile.toml only after that review.
+.venv/bin/python -m applypilot apply --input private/data/snapshots/FILE.json \
+  --preset ai-agents-llmops --run --limit 10
+.venv/bin/python -m applypilot sync  # all negotiation pages; use --pages N to set a ceiling
+.venv/bin/python -m applypilot analytics
+```
+
+During `apply --run`, each candidate is logged before and after a potential submission. An
+external ATS, CAPTCHA, screening question or ambiguous resume becomes `needs_manual`; the
+first `unknown` result stops the entire run without a retry. The run record reports its exact
+`run_id` and per-status counts.
+
 ## История и LLM
 
 ```bash
@@ -122,7 +169,7 @@ HTML-review разделяет top, остальные подтверждённ�
 .venv/bin/python -m applypilot llm preview --input private/data/snapshots/example.json --id 123
 ```
 
-SQLite хранит попытки, события и атомарные резервы бюджета. Дедупликация идёт по аккаунту и ID вакансии; безопасный профильный предел — 5 попыток за запуск и 20 за UTC-сутки. Старый `timeout` импортируется как `unknown`; последовательность `timeout → success` сохраняет окончательный успех. CSV остаётся форматом импорта/экспорта.
+SQLite хранит запуски, точные списки кандидатов, попытки, события и атомарные резервы бюджета. Дедупликация идёт по приватному ключу аккаунта и ID вакансии: блокируются только `success`, `already_applied`, `unknown` и незавершённый `submitting`; старые `skipped` не исключают свежую вакансию. Лимиты берутся из приватного профиля, без скрытого hard cap. Старый `timeout` импортируется как `unknown`; CSV остаётся форматом импорта/экспорта.
 
 LLM выключен по умолчанию. При включении нужно явно указать модель и ключ OpenRouter; модель проверяется по каталогу, автоматического перехода на платную модель нет. Максимум две попытки и 30 секунд, кэш зависит от ID, названия и описания вакансии, профиля, модели и версии промпта. В провайдер отправляется только минимальный набор сведений профиля.
 

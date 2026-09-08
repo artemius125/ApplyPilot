@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,12 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         links = page.locator('[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link"]')
         if links.count() == 0:
             return ApplyResult("needs_manual", "application button not found")
+        try:
+            href = str(links.first.get_attribute("href") or "")
+        except Exception:  # noqa: BLE001 - an unavailable attribute is not a submission outcome
+            href = ""
+        if href and not allowed_hh_url(urljoin(str(page.url), href)):
+            return ApplyResult("needs_manual", "application action points to an external ATS")
         links.first.click(timeout=15000)
         page.wait_for_timeout(1500)
         if not allowed_hh_url(str(page.url)):

@@ -33,12 +33,27 @@ def _same_vacancy(url: str, vacancy_id: str) -> bool:
             and parsed.path.rstrip("/").endswith(f"/vacancy/{vacancy_id}"))
 
 
-def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed") -> dict[str, Any]:
+def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed",
+                 timeout_ms: int = 10_000) -> dict[str, Any]:
     """Read one vacancy page. This adapter deliberately has no click/fill/eval calls."""
     vacancy_id = str(item.get("id") or item.get("vacancyId") or "")
     url = str(item.get("url") or f"https://hh.ru/vacancy/{vacancy_id}")
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page_status, body = _page_state(page)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page_status, body = _page_state(page)
+    except Exception as exc:  # noqa: BLE001 - a read-only timeout must not abort the whole review
+        kind = "timeout" if "timeout" in str(exc).lower() else "unavailable"
+        return {
+            "id": vacancy_id,
+            "url": url,
+            "auth_status": auth_status,
+            "page_status": kind,
+            "available": False,
+            "captcha_or_redirect": False,
+            "apply_button_visible": False,
+            "known_apply_status": "",
+            "unknown_conditions": [f"page read {kind}; manual review required"],
+        }
     low_body = body.lower()
     apply_button = page.locator(
         "[data-qa='vacancy-response-link-top'], [data-qa*='vacancy-response-button'], "
@@ -78,8 +93,60 @@ def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed"
     }
 
 
-def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3) -> list[str]:
-    """Inspect a resume page and at most three vacancies in a private context."""
+def _resume_titles(page: Any) -> list[str]:
+    """Read visible resume labels without interacting with the account page."""
+    selectors = (
+        "[data-qa='resume-title']",
+        "[data-qa*='resume-title']",
+        "a[href*='/resume/']",
+    )
+    titles: list[str] = []
+    for selector in selectors:
+        try:
+            values = page.locator(selector).all_inner_texts()
+        except Exception:  # noqa: BLE001 - HH markup differs by account/page version
+            values = []
+        titles.extend(value.strip() for value in values if value.strip())
+    return list(dict.fromkeys(titles))
+
+
+def inspect_resumes(state_path: Path, timeout_ms: int = 10_000) -> dict[str, Any]:
+    """Inspect session and available HH resume titles in an isolated read-only context."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("Install browser support with: pip install -e '.[browser]'") from exc
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(storage_state=str(state_path))
+            page = context.new_page()
+            page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=timeout_ms)
+            body = page.locator("body").inner_text(timeout=5000)
+            auth = classify_session_page(page.url, body)
+            return {
+                "auth_status": auth.status,
+                "detail": auth.detail,
+                "resume_titles": _resume_titles(page) if auth.status == "confirmed" else [],
+            }
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                LOGGER.debug("failed to close resume inspection context", exc_info=True)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                LOGGER.debug("failed to close resume inspection browser", exc_info=True)
+
+
+def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3,
+                  timeout_ms: int = 10_000) -> list[str]:
+    """Inspect a resume page and requested vacancies in a private read-only context."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -93,18 +160,22 @@ def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3)
             context = browser.new_context(storage_state=str(state_path))
             auth_page = context.new_page()
             try:
-                auth_page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
+                auth_page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=timeout_ms)
                 _page_status, body = _page_state(auth_page)
                 auth_status = classify_session_page(auth_page.url, body).status
             except Exception:
                 LOGGER.debug("failed to inspect authentication page", exc_info=True)
                 auth_status = "network_error"
-            for item in items[:max(0, min(limit, 3))]:
+            for item in items[:max(0, limit)]:
                 if auth_status != "confirmed":
                     results.append({"id": str(item.get("id", "")), "auth_status": auth_status,
                                     "available": False, "unknown_conditions": ["authentication not confirmed"]})
                     continue
-                results.append(inspect_page(context.new_page(), item, auth_status))
+                vacancy_page = context.new_page()
+                try:
+                    results.append(inspect_page(vacancy_page, item, auth_status, timeout_ms))
+                finally:
+                    vacancy_page.close()
     finally:
         if context is not None:
             try:

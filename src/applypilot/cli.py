@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
+import random
 import sys
 import time
 import uuid
@@ -30,6 +33,7 @@ from .storage import Store
 from .templates import create_template, list_templates
 
 PRESET_CHOICES = tuple(ROLE_PRESETS)
+LOGGER = logging.getLogger(__name__)
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -58,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--area", type=int, action="append")
     scan_cmd.add_argument("--page", type=int)
     scan_cmd.add_argument("--pages", type=int)
+    scan_cmd.add_argument("--request-budget", type=int,
+                          help="maximum search HTTP requests; overrides TOML")
     scan_cmd.add_argument("--days", type=int)
     scan_cmd.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
     scan_cmd.add_argument("--preset", choices=PRESET_CHOICES)
@@ -71,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (("plan", "select candidates offline"), ("apply", "prepare or send applications")):
         cmd = sub.add_parser(name, help=help_text)
         cmd.add_argument("--input", required=True, type=Path)
-        cmd.add_argument("--limit", type=int, default=5)
+        cmd.add_argument("--limit", type=int, help="maximum selected vacancies")
         cmd.add_argument("--min-score", type=int)
         cmd.add_argument("--rescore", action="store_true",
                          help="recalculate legacy snapshots instead of preserving historical score")
@@ -79,12 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "apply":
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--run", action="store_true")
+        else:
+            cmd.add_argument("--output", type=Path, help="private JSON plan output")
         cmd.add_argument("--preset", choices=PRESET_CHOICES)
 
     inspect_cmd = sub.add_parser("inspect", help="read vacancy pages without actions")
-    inspect_cmd.add_argument("--input", required=True, type=Path)
+    inspect_cmd.add_argument("--input", type=Path)
     inspect_cmd.add_argument("--limit", type=int, default=3)
+    inspect_cmd.add_argument("--page-timeout", type=float, default=10.0,
+                             help="per-page read-only deadline in seconds")
     inspect_cmd.add_argument("--selected", action="store_true", help="inspect top confirmed candidates only")
+    inspect_cmd.add_argument("--resumes", action="store_true", help="read available HH resume titles only")
     inspect_cmd.add_argument("--preset", choices=PRESET_CHOICES)
     inspect_cmd.add_argument("--min-score", type=int)
 
@@ -104,8 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     imp = history_sub.add_parser("import")
     imp.add_argument("--source", required=True, type=Path)
     history_sub.add_parser("reconcile").add_argument("--input", required=True, type=Path)
-    sub.add_parser("sync", help="show status sync availability")
-    sub.add_parser("analytics", help="show local application counts")
+    sync_cmd = sub.add_parser("sync", help="read negotiation statuses without messages")
+    sync_cmd.add_argument("--pages", type=int,
+                          help="maximum negotiation pages; omitted means fetch until HH returns an empty page")
+    sync_cmd.add_argument("--output", type=Path, help="private JSON sync report")
+    analytics_cmd = sub.add_parser("analytics", help="show local application counts")
+    analytics_cmd.add_argument("--output", type=Path, help="private analytics report")
     benchmark = sub.add_parser("benchmark", help="run offline scanner quality benchmark")
     benchmark.add_argument("--suite", default="tech-roles")
     benchmark.add_argument("--control-only", action="store_true")
@@ -130,6 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _config(args: argparse.Namespace) -> AppConfig:
     config = AppConfig.discover(data_dir=args.data_dir, profile=args.profile, search=args.search)
     ensure_data_dirs(config)
+    # Keep Playwright downloads private by default and use an existing private browser install.
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(config.root / "private" / "browsers"))
     return config
 
 
@@ -142,6 +159,42 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
             if key in search:
                 profile[key] = search[key]
     return profile
+
+
+def _account(profile: dict) -> str:
+    """Use an explicit private account key, retaining legacy compatibility."""
+    return str(profile.get("account") or "default").strip() or "default"
+
+
+def _default_limit(profile: dict) -> int:
+    return int((profile.get("limits") or {}).get("per_run", 5))
+
+
+def _write_private_json(path: Path, payload: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _default_artifact(config: AppConfig, category: str, suffix: str) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return config.data_dir / category / f"{category}-{stamp}-{uuid.uuid4().hex[:8]}.{suffix}"
+
+
+def _print_run_summary(store: Store, run_id: str) -> None:
+    summary = store.run_summary(run_id)
+    if summary is None:
+        return
+    run = summary["run"]
+    counts = summary["counts"]
+    print(f"run_id: {run_id}; run_status: {run['status']}")
+    for status in ("success", "already_applied", "needs_manual", "unknown", "failed_before_submit",
+                   "skipped", "prepared"):
+        print(f"{status}: {counts.get(status, 0)}")
+    if run["stop_reason"]:
+        print(f"stop_reason: {run['stop_reason']}")
 
 
 def _print_candidates(items: list[dict], profile: dict, limit: int, min_score: int,
@@ -203,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
             search["experience"] = {**search.get("experience", {}), "allowed": args.experience}
         if args.work_format is not None:
             search["work_formats"] = args.work_format
+        if args.request_budget is not None:
+            search["request_budget"] = args.request_budget
         if args.add_query:
             additions = [value.strip() for value in args.add_query if value.strip()]
             if not additions:
@@ -224,7 +279,13 @@ def main(argv: list[str] | None = None) -> int:
         all_items: list[dict] = []
         segments = []
         group_queries: list[str] = []
-        remaining_requests = int(search.get("max_queries", 40))
+        if args.pages is not None and args.pages < 1:
+            print("--pages must be positive", file=sys.stderr)
+            return 2
+        if args.request_budget is not None and args.request_budget < 1:
+            print("--request-budget must be positive", file=sys.stderr)
+            return 2
+        remaining_requests = int(search["request_budget"])
         page = args.page if args.page is not None else 0
         for group in groups:
             if remaining_requests <= 0:
@@ -236,8 +297,7 @@ def main(argv: list[str] | None = None) -> int:
             if not queries:
                 continue
             areas = args.area if args.area is not None else [int(value) for value in (group.get("areas") or [113])]
-            pages = args.pages if args.pages is not None else int(group.get("max_pages", 2))
-            pages = max(1, min(pages, 20))
+            pages = args.pages if args.pages is not None else int(group["max_pages"])
             remote = args.remote if args.remote is not None else bool(group.get("only_remote", False))
             days = args.days if args.days is not None else group.get("days")
             date_from = (datetime.now(UTC) - timedelta(days=int(days))).date().isoformat() if days else None
@@ -314,37 +374,72 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         store = Store(config.db_path)
         profile = _profile(config, search)
-        account = str(profile.get("account", "default"))
+        account = _account(profile)
+        limit = args.limit if args.limit is not None else _default_limit(profile)
+        if limit < 1:
+            print("--limit must be positive", file=sys.stderr)
+            return 2
         min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
-        selected = _print_candidates(items, profile, args.limit, min_score,
-                                      args.skip_security, set(store.read_statuses(account)), args.rescore)
+        selected = _print_candidates(items, profile, limit, min_score,
+                                      args.skip_security, store.blocked_ids(account), args.rescore)
         if args.command == "plan":
+            output = args.output or _default_artifact(config, "plans", "json")
+            _write_private_json(output, {
+                "schema_version": 1,
+                "created_at": datetime.now(UTC).isoformat(),
+                "account": account,
+                "input": str(args.input.resolve()),
+                "requested_limit": limit,
+                "selected": selected,
+            })
+            print(f"plan: {output}")
             return 0
         if not args.dry_run and not args.run:
             print("Choose --dry-run or --run", file=sys.stderr)
             return 2
         run_id = uuid.uuid4().hex
         if args.dry_run:
-            return 0
-        return _run_apply(config, store, selected, run_id)
+            return _run_dry(store, selected, run_id, account, args.input, limit)
+        return _run_apply(config, store, selected, run_id, account, args.input, limit)
     if args.command == "inspect":
         ok, detail = validate_state(session_path)
         if not ok:
             print(f"session unavailable: {detail}; run `applypilot login` first", file=sys.stderr)
             return 2
-        from .inspection import inspect_items
-        items = load_items(args.input)
-        if args.selected:
-            try:
-                search = effective_search(config.load_search(), args.preset)
-            except ConfigError as exc:
-                print(f"invalid search configuration: {exc}", file=sys.stderr)
+        from .inspection import inspect_items, inspect_resumes
+        try:
+            if args.resumes:
+                if args.page_timeout <= 0:
+                    print("--page-timeout must be positive", file=sys.stderr)
+                    return 2
+                print(json.dumps(inspect_resumes(
+                    session_path, timeout_ms=round(args.page_timeout * 1000)
+                ), ensure_ascii=False, sort_keys=True))
+                if args.input is None:
+                    return 0
+            if args.input is None:
+                print("--input is required unless --resumes is used", file=sys.stderr)
                 return 2
-            min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
-            items = [candidate.to_dict() for candidate in filter_candidates(
-                items, _profile(config, search), min(args.limit, 3), min_score
-            )]
-        results = inspect_items(session_path, items, min(args.limit, 3))
+            if args.limit < 1:
+                print("--limit must be positive", file=sys.stderr)
+                return 2
+            items = load_items(args.input)
+            if args.selected:
+                try:
+                    search = effective_search(config.load_search(), args.preset)
+                except ConfigError as exc:
+                    print(f"invalid search configuration: {exc}", file=sys.stderr)
+                    return 2
+                min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
+                profile = _profile(config, search)
+                items = [candidate.to_dict() for candidate in filter_candidates(
+                    items, profile, args.limit, min_score,
+                    blocked_ids=Store(config.db_path).blocked_ids(_account(profile)),
+                )]
+            results = inspect_items(session_path, items, args.limit, round(args.page_timeout * 1000))
+        except Exception as exc:  # noqa: BLE001 - a read-only browser failure is reported, never retried
+            print(f"inspect: error ({str(exc)[:240]})", file=sys.stderr)
+            return 3
         for result in results:
             print(result)
         return 0
@@ -384,12 +479,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "history":
         store = Store(config.db_path)
+        account = _account(_profile(config))
         if args.history_action == "import":
             paths = [args.source] if args.source.is_file() else sorted(args.source.rglob("apply_log.csv"))
-            total = sum(store.import_csv(path) for path in paths)
-            print(f"imported: {total}")
+            reports = [store.import_csv(path, account) for path in paths]
+            for source, result in zip(paths, reports, strict=True):
+                print(
+                    f"import: {source}; logical_rows={result.logical_rows}; "
+                    f"physical_data_lines={result.physical_data_lines}; events_added={result.events_added}; "
+                    f"already_imported={result.already_imported}; sha256={result.source_sha256}"
+                )
         else:
-            changed = store.reconcile(args.input)
+            changed = store.reconcile(args.input, account)
             print(f"reconciled: {changed}; unknown attempts were not retried")
         return 0
     if args.command == "sync":
@@ -399,14 +500,27 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         from .negotiations import SyncError, sync_statuses
         try:
-            rows = sync_statuses(session_path, Store(config.db_path), max_pages=1)
+            account = _account(_profile(config))
+            if args.pages is not None and args.pages < 1:
+                print("--pages must be positive", file=sys.stderr)
+                return 2
+            rows = sync_statuses(session_path, Store(config.db_path), account=account, max_pages=args.pages)
         except SyncError as exc:
             print(f"sync: error ({exc})", file=sys.stderr)
             return 3
+        output = args.output or _default_artifact(config, "reports", "json")
+        _write_private_json(output, {"account": account, "rows": rows})
         print(f"sync: {len(rows)} statuses; messages=disabled")
+        print(f"sync_report: {output}")
         return 0
     if args.command == "analytics":
-        print(report(Store(config.db_path)))
+        account = _account(_profile(config))
+        result = report(Store(config.db_path), account)
+        output = args.output or _default_artifact(config, "reports", "txt")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(result + "\n", encoding="utf-8")
+        print(result)
+        print(f"analytics_report: {output}")
         return 0
     if args.command == "benchmark":
         try:
@@ -441,8 +555,34 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str) -> int:
-    """Execute explicitly requested browser submissions with bounded state transitions."""
+def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
+             input_path: Path, requested_limit: int) -> int:
+    """Record an offline, immutable candidate list without creating attempts."""
+    with store.run_lock():
+        store.start_run(run_id, account, "dry-run", input_path, requested_limit, selected)
+        for item in selected:
+            note = f"would apply with resume={item.get('resume', '')}"
+            store.mark_run_item(run_id, str(item.get("id", "")), "prepared", note)
+            print(f"{item.get('id')}: prepared — {note}")
+        store.finish_run(run_id, "completed")
+    _print_run_summary(store, run_id)
+    return 0
+
+
+def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
+               account: str, input_path: Path, requested_limit: int) -> int:
+    """Execute explicitly requested browser submissions with auditable stop conditions."""
+    try:
+        profile = _profile(config, effective_search(config.load_search(), None))
+    except ConfigError as exc:
+        print(f"invalid search configuration: {exc}", file=sys.stderr)
+        return 2
+    if profile.get("reviewed") is not True:
+        print("profile is not reviewed; real submissions require reviewed = true", file=sys.stderr)
+        return 2
+    if _account(profile) != account:
+        print("profile account changed after candidate selection; rerun dry-run", file=sys.stderr)
+        return 2
     state_path = config.data_dir / "hh_session.json"
     session = check_session(state_path)
     if session.status != "confirmed":
@@ -456,58 +596,97 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     except ImportError:
         print("browser support missing; install with: pip install -e '.[browser]'", file=sys.stderr)
         return 2
-    try:
-        profile = _profile(config, effective_search(config.load_search(), None))
-    except ConfigError as exc:
-        print(f"invalid search configuration: {exc}", file=sys.stderr)
-        return 2
-    if profile.get("reviewed") is not True:
-        print("profile is not reviewed; real submissions require reviewed = true", file=sys.stderr)
-        return 2
     limits = profile.get("limits", {})
     per_run = int(limits.get("per_run", 5))
     per_day = int(limits.get("per_day", 20))
-    account = str(profile.get("account", "default"))
-    candidates = selected
-    with store.run_lock(), sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+    if per_run < 1 or per_day < 1:
+        print("profile limits must be positive", file=sys.stderr)
+        return 2
+    timing = profile.get("apply", {}) or {}
+    delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
+    delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
+    run_status = "completed"
+    stop_reason = ""
+    exit_code = 0
+    with store.run_lock():
+        store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
+        browser = None
         context = None
+        playwright = None
         try:
-            context = browser.new_context(storage_state=str(state_path), viewport={"width": 1280, "height": 900})
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                storage_state=str(state_path), viewport={"width": 1280, "height": 900}
+            )
             page = context.new_page()
-            for item in candidates:
-                llm_cfg = profile.get("llm", {})
+            for index, item in enumerate(selected, 1):
+                llm_cfg = profile.get("llm", {}) or {}
                 preflight_error = _submission_preflight(item, bool(llm_cfg.get("enabled")))
                 if preflight_error:
-                    note = preflight_error
-                    store.record(item, "needs_manual", note, run_id, account)
-                    print(f"{item.get('id')}: needs_manual — {note}")
+                    store.record(item, "needs_manual", preflight_error, run_id, account)
+                    print(f"{item.get('id')}: needs_manual — {preflight_error}")
                     continue
-                resume = str(item.get("resume", "")).strip()
                 allowed, reason = store.reserve(item, run_id, per_run, per_day, account)
                 if not allowed:
-                    print(f"budget stop: {reason}", file=sys.stderr)
+                    store.mark_run_item(run_id, str(item.get("id", "")), "skipped", reason)
+                    print(f"{item.get('id')}: skipped — {reason}")
+                    if reason.startswith(("run budget", "daily budget")):
+                        run_status = "budget_exhausted"
+                        stop_reason = reason
+                        break
                     continue
                 cover_letter = ""
                 if llm_cfg.get("enabled"):
-                    cover_letter, source = generate(item, profile, config.data_dir / "llm-cache",
-                                                    str(llm_cfg.get("model", "")),
-                                                    enabled=bool(llm_cfg.get("enabled", False)), required=True)
+                    cover_letter, source = generate(
+                        item, profile, config.data_dir / "llm-cache", str(llm_cfg.get("model", "")),
+                        enabled=True, required=True,
+                    )
                     item["llm_source"] = source
-                result = apply_one(page, item, resume, cover_letter)
+                result = apply_one(page, item, str(item.get("resume", "")).strip(), cover_letter)
                 store.record(item, result.status, result.note, run_id, account)
                 print(f"{item.get('id')}: {result.status} — {result.note}")
-                time.sleep(1)
+                if result.status == "unknown":
+                    run_status = "stopped_unknown"
+                    stop_reason = f"unknown result for vacancy {item.get('id')}"
+                    exit_code = 3
+                    break
+                if index < len(selected) and delay_max:
+                    time.sleep(random.uniform(delay_min, delay_max))
+        except Exception as exc:  # noqa: BLE001 - journal the run even if browser setup fails
+            run_status = "failed"
+            stop_reason = f"runner error: {str(exc)[:160]}"
+            exit_code = 3
+            print(stop_reason, file=sys.stderr)
         finally:
             try:
                 if context is not None:
-                    try:
-                        save_state(state_path, context.storage_state())
-                    finally:
-                        context.close()
+                    save_state(state_path, context.storage_state())
+            except Exception as exc:  # noqa: BLE001 - session persistence must not leave a run unfinished
+                if run_status == "completed":
+                    run_status = "failed"
+                    stop_reason = f"session persistence error: {str(exc)[:160]}"
+                    exit_code = 3
+                    print(stop_reason, file=sys.stderr)
             finally:
-                browser.close()
-    return 0
+                if context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        LOGGER.debug("Could not close browser context", exc_info=True)
+                if browser is not None:
+                    try:
+                        browser.close()
+                    except Exception:
+                        LOGGER.debug("Could not close browser", exc_info=True)
+                if playwright is not None:
+                    try:
+                        playwright.stop()
+                    except Exception:
+                        LOGGER.debug("Could not stop Playwright", exc_info=True)
+            store.finish_run(run_id, run_status, stop_reason)
+    _print_run_summary(store, run_id)
+    return exit_code
 
 
 def _submission_preflight(item: dict, llm_enabled: bool) -> str:

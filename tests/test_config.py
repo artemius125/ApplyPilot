@@ -8,7 +8,7 @@ def test_effective_search_has_portable_defaults_and_cli_preset():
     result = effective_search({"areas": [1]}, "python-backend")
 
     assert result["areas"] == [1]
-    assert result["max_pages"] == 2
+    assert result["max_pages"] == 20
     assert "Python Developer" in result["queries"]
 
 
@@ -59,3 +59,11 @@ def test_scan_add_query_preserves_a_preset_query_roster():
 
     assert args.preset == "ai-agents-llmops"
     assert args.add_query == ["LLM Platform"]
+
+
+def test_request_budget_is_configurable_without_a_hidden_cap():
+    result = effective_search({"request_budget": 900, "details_limit": 1200, "max_pages": 30})
+
+    assert result["request_budget"] == 900
+    assert result["details_limit"] == 1200
+    assert result["max_pages"] == 30

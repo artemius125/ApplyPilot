@@ -2,6 +2,7 @@ preset = "ai-llm"
 queries = ["AI Agent Engineer", "LLM Engineer", "Python Backend"]
 areas = [113]
 max_pages = 1
+request_budget = 50
 only_remote = true
 days = 7
 min_score = 50

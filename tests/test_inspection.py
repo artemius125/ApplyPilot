@@ -58,3 +58,17 @@ def test_regional_hh_redirect_is_not_marked_as_external_redirect():
     result = inspect_page(page, {"id": "42", "url": "https://hh.ru/vacancy/42"})
 
     assert result["captcha_or_redirect"] is False
+
+
+def test_inspection_timeout_becomes_a_manual_condition_without_an_action():
+    page = _Page()
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("Timeout 10000ms exceeded")
+
+    page.goto = timeout
+    result = inspect_page(page, {"id": "42", "url": "https://hh.ru/vacancy/42"}, timeout_ms=10_000)
+
+    assert result["page_status"] == "timeout"
+    assert result["available"] is False
+    assert result["unknown_conditions"] == ["page read timeout; manual review required"]

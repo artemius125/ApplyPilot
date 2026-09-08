@@ -148,7 +148,7 @@ def scan(query: str, area: int = 113, page: int = 0, only_remote: bool = False,
 def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
               only_remote: bool = False, date_from: str | None = None,
               session: requests.Session | None = None,
-              page_limit: int = 20, start_page: int = 0,
+              page_limit: int | None = None, start_page: int = 0,
               pause_seconds: float = 1.0,
               request_budget: int | None = None) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
     """Scan a bounded query/area/page matrix and retain segment-level diagnostics.
@@ -161,7 +161,9 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
     segments: list[ScanSegment] = []
     queries = [str(query).strip() for query in queries if str(query).strip()]
     areas = [int(area) for area in areas]
-    pages = max(1, min(int(max_pages), page_limit))
+    pages = max(1, int(max_pages))
+    if page_limit is not None:
+        pages = min(pages, max(1, int(page_limit)))
     aborted = False
     remaining_requests = None if request_budget is None else max(0, int(request_budget))
     last_request_at: float | None = None

@@ -1,5 +1,8 @@
 from applypilot.autoapply import apply_one
-from applypilot.cli import _submission_preflight
+from applypilot.cli import _run_apply, _submission_preflight
+from applypilot.config import AppConfig
+from applypilot.session import SessionCheck
+from applypilot.storage import Store
 
 
 class _Locator:
@@ -161,3 +164,62 @@ def test_submission_preflight_stops_before_a_budget_reservation():
         "required cover letter is missing"
     )
     assert _submission_preflight(_item(resume="Python"), False) == ""
+
+
+def test_unknown_result_stops_the_entire_run_before_the_next_vacancy(tmp_path, monkeypatch):
+    class _Context:
+        def new_page(self):
+            return object()
+
+        def storage_state(self):
+            return {"cookies": []}
+
+        def close(self):
+            return None
+
+    class _Browser:
+        def new_context(self, **_kwargs):
+            return _Context()
+
+        def close(self):
+            return None
+
+    class _Playwright:
+        class chromium:
+            @staticmethod
+            def launch(**_kwargs):
+                return _Browser()
+
+        def stop(self):
+            return None
+
+    config = AppConfig(tmp_path, tmp_path / "data", tmp_path / "profile.toml")
+    store = Store(config.db_path)
+    selected = [
+        {"id": "one", "url": "https://hh.ru/vacancy/1", "resume": "Resume"},
+        {"id": "two", "url": "https://hh.ru/vacancy/2", "resume": "Resume"},
+    ]
+    calls = []
+
+    monkeypatch.setattr("applypilot.cli.effective_search", lambda *_args: {})
+    monkeypatch.setattr("applypilot.cli._profile", lambda *_args: {
+        "reviewed": True, "account": "account", "limits": {"per_run": 10, "per_day": 10},
+        "apply": {"delay_min_seconds": 0, "delay_max_seconds": 0}, "llm": {"enabled": False},
+    })
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: type("_Starter", (), {
+        "start": staticmethod(lambda: _Playwright()),
+    })())
+    monkeypatch.setattr("applypilot.autoapply.apply_one", lambda _page, item, *_args: (
+        calls.append(item["id"]) or type("_Result", (), {"status": "unknown", "note": "ambiguous"})()
+    ))
+    monkeypatch.setattr("applypilot.cli.save_state", lambda *_args: None)
+
+    result = _run_apply(config, store, selected, "run", "account", tmp_path / "input.json", 2)
+
+    assert result == 3
+    assert calls == ["one"]
+    summary = store.run_summary("run")
+    assert summary is not None
+    assert summary["run"]["status"] == "stopped_unknown"
+    assert summary["counts"] == {"unknown": 1, "prepared": 1}

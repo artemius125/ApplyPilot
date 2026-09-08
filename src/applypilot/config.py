@@ -12,7 +12,7 @@ from .presets import ROLE_PRESETS, resolve_search
 VALID_MISSING_SALARY = {"include", "exclude", "only"}
 VALID_SALARY_POLICY = {"possible", "guaranteed"}
 DEFAULT_SEARCH: dict[str, Any] = {
-    "areas": [113], "max_pages": 2, "max_queries": 40, "details_limit": 100,
+    "areas": [113], "max_pages": 20, "request_budget": 500, "details_limit": 500,
     "days": 7, "only_remote": False, "min_score": 0,
     "salary": {"currency": "RUR", "from": 0, "missing": "include", "policy": "possible"},
 }
@@ -72,12 +72,14 @@ def ensure_data_dirs(config: AppConfig) -> None:
 
 def validate_search(search: dict[str, Any]) -> dict[str, Any]:
     values = dict(search)
-    for key in ("max_pages", "max_queries", "details_limit", "days"):
+    for key in ("max_pages", "max_queries", "request_budget", "details_limit", "days"):
         if values.get(key) is not None and int(values[key]) < 0:
             raise ConfigError(f"{key} must be non-negative")
-    if int(values.get("max_pages", 0)) == 0:
+    if "max_pages" in values and int(values["max_pages"]) == 0:
         raise ConfigError("max_pages must be positive")
-    if int(values.get("max_queries", 0)) == 0:
+    if "request_budget" in values and int(values["request_budget"]) == 0:
+        raise ConfigError("request_budget must be positive")
+    if "max_queries" in values and int(values["max_queries"]) == 0:
         raise ConfigError("max_queries must be positive")
     salary = values.get("salary", {}) or {}
     if str(salary.get("missing", "include")) not in VALID_MISSING_SALARY:
@@ -121,15 +123,20 @@ def effective_search(raw: dict[str, Any], preset_name: str | None = None,
     requested = preset_name or raw.get("preset")
     if requested and requested not in ROLE_PRESETS:
         raise ConfigError(f"unknown preset: {requested}")
+    resolved = resolve_search(raw, requested)
+    if "request_budget" not in resolved and "max_queries" in resolved:
+        resolved["request_budget"] = resolved["max_queries"]
     values = dict(DEFAULT_SEARCH)
-    values.update(resolve_search(raw, requested))
+    values.update(resolved)
     for key, value in (overrides or {}).items():
         if value is not None:
             values[key] = value
     values["areas"] = [int(area) for area in values.get("areas", [113])]
-    values["max_pages"] = min(int(values.get("max_pages", 2)), 20)
-    values["max_queries"] = min(int(values.get("max_queries", 40)), 40)
-    values["details_limit"] = min(int(values.get("details_limit", 100)), 100)
+    # ``max_queries`` was the old name for the total HTTP request budget.
+    # Keep it as a TOML compatibility alias, but never silently clamp either value.
+    values["max_pages"] = int(values["max_pages"])
+    values["request_budget"] = int(values["request_budget"])
+    values["details_limit"] = int(values["details_limit"])
     values["salary"] = {**DEFAULT_SEARCH["salary"], **(values.get("salary", {}) or {})}
     return validate_search(values)
 
