@@ -194,8 +194,6 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
         hard_killers.append("role:title_not_target")
     if role_terms and not any(matches(term, text) for term in role_terms):
         hard_killers.append("role:no_match")
-    if str(candidate.experience).lower() in {"morethan6", "более 6 лет", "опыт от 6 лет"}:
-        hard_killers.append("experience:moreThan6")
     hot = [str(term) for term in rules["hot"] if matches(str(term), text)]
     high = [str(term) for term in rules["high"] if matches(str(term), text)]
     medium = [str(term) for term in rules["medium"] if matches(str(term), text)]

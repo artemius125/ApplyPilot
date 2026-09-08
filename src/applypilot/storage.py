@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,6 +73,9 @@ STATUS_RANK = {
     "already_applied": 4,
     "success": 4,
 }
+NEGOTIATION_STATUSES = {
+    "not_viewed", "viewed", "invitation", "discard", "phone_interview", "interview",
+}
 LEGACY_STATUS_MAP = {
     "timeout": "unknown",
     "error": "failed_before_submit",
@@ -105,6 +109,8 @@ class Store:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._run_lock_depth = 0
+        self._run_lock_owner: int | None = None
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -370,13 +376,21 @@ class Store:
                 (account, source, status, item_count, error, now()),
             )
 
-    def replace_negotiation_statuses(self, rows: list[dict[str, Any]], account: str = "default") -> None:
+    def replace_negotiation_statuses(self, rows: list[dict[str, Any]], account: str = "default",
+                                     *, complete: bool = True, snapshot_status: str | None = None,
+                                     snapshot_source: str = "hh.ru", snapshot_error: str = "") -> None:
+        """Store a negotiation page set and optionally its sync snapshot atomically."""
         fetched_at = now()
+        normalized: list[tuple[str, dict[str, Any]]] = []
+        for row in rows:
+            vacancy_id = str(row.get("vacancy_id") or row.get("id") or "")
+            if vacancy_id:
+                normalized.append((vacancy_id, row))
         with self.connect() as conn:
-            for row in rows:
-                vacancy_id = str(row.get("vacancy_id") or row.get("id") or "")
-                if not vacancy_id:
-                    continue
+            conn.execute("BEGIN IMMEDIATE")
+            if complete:
+                conn.execute("DELETE FROM negotiation_statuses WHERE account=?", (account,))
+            for vacancy_id, row in normalized:
                 conn.execute(
                     """INSERT INTO negotiation_statuses
                     (account,vacancy_id,status,name,company,updated_at,fetched_at)
@@ -385,7 +399,13 @@ class Store:
                     name=excluded.name,company=excluded.company,updated_at=excluded.updated_at,
                     fetched_at=excluded.fetched_at""",
                     (account, vacancy_id, str(row.get("status", "")), row.get("name", ""),
-                     row.get("company", ""), row.get("updated_at", ""), fetched_at),
+                     row.get("company", ""), str(row.get("updated_at", "")), fetched_at),
+                )
+            if snapshot_status is not None:
+                conn.execute(
+                    """INSERT INTO sync_snapshots(account,source,status,item_count,error,created_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (account, snapshot_source, snapshot_status, len(normalized), snapshot_error, now()),
                 )
 
     def reconcile_unknowns_from_negotiations(self, account: str = "default") -> list[str]:
@@ -397,8 +417,10 @@ class Store:
                 """SELECT a.vacancy_id,a.run_id,n.status AS negotiation_status
                 FROM attempts a JOIN negotiation_statuses n
                   ON n.account=a.account AND n.vacancy_id=a.vacancy_id
-                WHERE a.account=? AND a.status='unknown' AND n.status<>''""",
-                (account,),
+                WHERE a.account=? AND a.status='unknown'
+                  AND n.status IN (?, ?, ?, ?, ?, ?)
+                  AND n.fetched_at >= a.updated_at""",
+                (account, *sorted(NEGOTIATION_STATUSES)),
             ).fetchall()
             for row in rows:
                 vacancy_id = row["vacancy_id"]
@@ -432,6 +454,54 @@ class Store:
                     )
                 reconciled.append(vacancy_id)
         return reconciled
+
+    def recover_interrupted_runs(self, account: str = "default") -> list[str]:
+        """Recover submitting attempts after the caller acquires the run lock."""
+        if self._run_lock_depth <= 0 or self._run_lock_owner != threading.get_ident():
+            raise RuntimeError("run lock required")
+        timestamp = now()
+        recovered: list[str] = []
+        run_ids: set[str] = set()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT vacancy_id,run_id FROM attempts
+                WHERE account=? AND status='submitting' ORDER BY vacancy_id""",
+                (account,),
+            ).fetchall()
+            for row in rows:
+                vacancy_id = row["vacancy_id"]
+                run_id = row["run_id"]
+                note = "submission interrupted before outcome"
+                conn.execute(
+                    """UPDATE attempts SET status='unknown',note=?,updated_at=?
+                    WHERE account=? AND vacancy_id=? AND status='submitting'""",
+                    (note, timestamp, account, vacancy_id),
+                )
+                conn.execute(
+                    """INSERT INTO events(account,vacancy_id,status,note,run_id,created_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (account, vacancy_id, "unknown", note, run_id, timestamp),
+                )
+                if run_id:
+                    run_ids.add(run_id)
+                    conn.execute(
+                        """UPDATE run_items SET status='unknown',note=?,updated_at=?
+                        WHERE run_id=? AND vacancy_id=?""",
+                        (note, timestamp, run_id, vacancy_id),
+                    )
+                conn.execute(
+                    "DELETE FROM reservations WHERE account=? AND vacancy_id=?",
+                    (account, vacancy_id),
+                )
+                recovered.append(vacancy_id)
+            for run_id in run_ids:
+                conn.execute(
+                    """UPDATE runs SET status='interrupted',stop_reason=?,finished_at=?
+                    WHERE run_id=? AND account=? AND status='running'""",
+                    ("interrupted submissions recovered", timestamp, run_id, account),
+                )
+        return recovered
 
     def latest_sync(self, account: str = "default") -> dict[str, Any] | None:
         if not self.path.exists():
@@ -473,7 +543,13 @@ class Store:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            owner = threading.get_ident()
+            self._run_lock_owner = owner
+            self._run_lock_depth += 1
             try:
                 yield
             finally:
+                self._run_lock_depth -= 1
+                if self._run_lock_depth == 0:
+                    self._run_lock_owner = None
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

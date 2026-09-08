@@ -22,6 +22,85 @@ class ConfigError(ValueError):
     pass
 
 
+def professional_context(profile: dict[str, Any]) -> dict[str, Any]:
+    """Return the validated, allowlisted professional profile context."""
+    if not isinstance(profile, dict):
+        raise ConfigError("profile must be a table")
+    raw = profile.get("professional")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("professional must be a table")
+
+    context: dict[str, Any] = {}
+    for field in ("summary", "resume_text"):
+        value = raw.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ConfigError(f"professional.{field} must be a string")
+        value = value.strip()
+        if value:
+            context[field] = value
+
+    for field in ("skills",):
+        value = raw.get(field)
+        if value is None:
+            continue
+        context[field] = _professional_string_list(value, f"professional.{field}")
+        if not context[field]:
+            del context[field]
+
+    for field, allowed in (
+        ("experience", ("company", "role", "period", "description", "achievements")),
+        ("projects", ("name", "role", "description", "technologies", "achievements")),
+    ):
+        value = raw.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(f"professional.{field} must be an array")
+        records: list[dict[str, Any]] = []
+        for index, record in enumerate(value):
+            path = f"professional.{field}[{index}]"
+            if not isinstance(record, dict):
+                raise ConfigError(f"{path} must be a table")
+            cleaned: dict[str, Any] = {}
+            for key in allowed:
+                item = record.get(key)
+                if item is None:
+                    continue
+                item_path = f"{path}.{key}"
+                if key in ("achievements", "technologies"):
+                    cleaned[key] = _professional_string_list(item, item_path)
+                    if not cleaned[key]:
+                        del cleaned[key]
+                else:
+                    if not isinstance(item, str):
+                        raise ConfigError(f"{item_path} must be a string")
+                    item = item.strip()
+                    if item:
+                        cleaned[key] = item
+            if cleaned:
+                records.append(cleaned)
+        if records:
+            context[field] = records
+    return context
+
+
+def _professional_string_list(value: Any, path: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ConfigError(f"{path} must be an array")
+    result: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ConfigError(f"{path}[{index}] must be a string")
+        item = item.strip()
+        if item:
+            result.append(item)
+    return result
+
+
 @dataclass(frozen=True)
 class AppConfig:
     root: Path

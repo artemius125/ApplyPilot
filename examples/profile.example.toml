@@ -17,7 +17,41 @@ confirmation_timeout_seconds = 15
 [llm]
 enabled = false
 model = "openrouter/free"
-prompt_version = "1"
+
+[cover_letter]
+# Explicit mode takes priority over llm.enabled. Use "template" or "llm" to enable.
+mode = "off"
+fallback_to_template = false
+template = """
+Здравствуйте!
+Меня заинтересовала вакансия «{vacancy}».
+Буду рад обсудить задачи и подробнее рассказать о своём опыте.
+С уважением, {name}
+"""
+# Alternatively, remove template and set template_file = "cover-letter.md".
+
+[professional]
+# Fill only with your actual experience. Empty optional fields are omitted.
+summary = ""
+skills = []
+# UTF-8 .txt/.md path relative to this profile; PDF/DOCX are not supported.
+# resume_file = "resume.md"
+# Or use inline resume_text instead of resume_file.
+
+# Repeat these tables for each role/project; uncomment and fill with real facts.
+# [[professional.experience]]
+# company = ""
+# role = ""
+# period = ""
+# description = ""
+# achievements = []
+
+# [[professional.projects]]
+# name = ""
+# role = ""
+# description = ""
+# technologies = []
+# achievements = []
 
 [resumes]
 default = "AI Agent Engineer"

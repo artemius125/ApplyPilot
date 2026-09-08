@@ -13,6 +13,15 @@ LETTER_SELECTOR = (
 )
 
 
+def _contains_captcha(text: str) -> bool:
+    lowered = text.casefold()
+    return "captcha" in lowered or "капч" in lowered
+
+
+def _normalize_resume_title(value: str) -> str:
+    return " ".join(str(value).split()).casefold()
+
+
 @dataclass(frozen=True)
 class ApplyResult:
     status: str
@@ -60,8 +69,8 @@ def has_screening_form(page_or_dialog) -> bool:
     return False
 
 
-def _select_resume(page, dialog, submit, resume: str) -> str:
-    """Select one exact visible title inside the popup, or accept HH's sole preselection."""
+def _select_resume(page, dialog, resume: str) -> str:
+    """Accept HH's sole visible resume, otherwise require one exact title match."""
     root = dialog or page
     options = root.locator(RESUME_SELECTOR)
     visible = []
@@ -73,15 +82,15 @@ def _select_resume(page, dialog, submit, resume: str) -> str:
                 continue
             lines = [" ".join(line.split()) for line in option.inner_text(timeout=1000).splitlines() if line.strip()]
             visible.append(option)
-            if lines and lines[0].casefold() == resume.casefold():
+            if lines and _normalize_resume_title(lines[0]) == _normalize_resume_title(resume):
                 exact.append(option)
         except Exception:
             LOGGER.debug("Could not inspect a resume option", exc_info=True)
     if len(exact) == 1:
         exact[0].click(timeout=8000)
         return ""
-    if len(visible) <= 1 and submit.is_visible(timeout=2000):
-        return ""  # HH preselected the only available resume.
+    if len(visible) == 1:
+        return ""  # HH already selected the only resume offered by this response popup.
     return "resume selection is missing or ambiguous"
 
 
@@ -93,8 +102,8 @@ def _wait_for_confirmation(page, timeout_seconds: float) -> ApplyResult | None:
             return ApplyResult("success", "confirmed by HH page after submission")
         if "вы уже откликались" in body or "уже откликались" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if "captcha" in body or "капч" in body:
-            return ApplyResult("needs_manual", "CAPTCHA detected after submission")
+        if _contains_captcha(body):
+            return ApplyResult("unknown", "CAPTCHA detected after submission")
         if check + 1 < checks:
             page.wait_for_timeout(500)
     return None
@@ -118,7 +127,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         body = page.locator("body").inner_text().lower()
         if "вы откликнулись" in body or "отклик отправлен" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if "captcha" in body:
+        if _contains_captcha(body):
             return ApplyResult("needs_manual", "CAPTCHA detected")
         links = page.locator('[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link"]')
         if links.count() == 0:
@@ -138,14 +147,16 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("success", "confirmed after first response action")
         if "вы уже откликались" in body or "уже откликались" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if "captcha" in body:
-            return ApplyResult("needs_manual", "CAPTCHA detected")
+        if _contains_captcha(body):
+            return ApplyResult("unknown", "CAPTCHA detected after first response action")
         submit = page.locator(SUBMIT_SELECTOR).first
         dialog = _response_dialog(page, submit)
         if dialog is None and not submit.is_visible(timeout=2000):
             return ApplyResult("unknown", "first response action had no follow-up dialog")
         response_root = dialog or page
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
+        if _contains_captcha(response_text):
+            return ApplyResult("unknown", "CAPTCHA detected after first response action")
         if "поменяйте видимость резюме" in response_text:
             return ApplyResult("needs_manual", "resume visibility must be changed manually")
         if "сопроводительное письмо обязательное" in response_text and not cover_letter.strip():
@@ -157,7 +168,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         )
         if dialog_controls.count() == 0:
             return ApplyResult("unknown", "first response action had no follow-up dialog")
-        resume_error = _select_resume(page, dialog, submit, resume)
+        resume_error = _select_resume(page, dialog, resume)
         if resume_error:
             return ApplyResult("needs_manual", resume_error)
         if cover_letter:
