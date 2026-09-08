@@ -22,12 +22,18 @@ from .config import (
     search_origins,
     validate_search,
 )
+from .cover_letters import letter_mode, load_letter_profile, render_template
 from .llm import generate
-from .parser import enrich_items, load_items, save_snapshot, scan_many
+from .parser import ScanSegment, enrich_items, load_items, save_snapshot, scan_many
 from .presets import ROLE_PRESETS
 from .quality import run_benchmark
 from .review import write_review
-from .scoring import evaluate_search_filter, filter_candidates, prioritize_for_enrichment
+from .scoring import (
+    choose_resume,
+    evaluate_search_filter,
+    filter_candidates,
+    prioritize_for_enrichment,
+)
 from .session import check_session, login, save_state, validate_state
 from .storage import Store
 from .templates import create_template, list_templates
@@ -108,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     preview = llm_sub.add_parser("preview")
     preview.add_argument("--input", required=True, type=Path)
     preview.add_argument("--id", required=True)
+    letter = sub.add_parser("letter", help="preview a template or LLM cover letter")
+    letter_sub = letter.add_subparsers(dest="letter_action", required=True)
+    letter_preview = letter_sub.add_parser("preview")
+    letter_preview.add_argument("--input", required=True, type=Path)
+    letter_preview.add_argument("--id", required=True)
     rerank = llm_sub.add_parser("rerank", help="explicitly run bounded optional LLM reranking")
     rerank.add_argument("--input", required=True, type=Path)
     rerank.add_argument("--model", required=True)
@@ -292,8 +303,6 @@ def main(argv: list[str] | None = None) -> int:
         remaining_requests = int(search["request_budget"])
         page = args.page if args.page is not None else 0
         for group in groups:
-            if remaining_requests <= 0:
-                break
             queries = [args.query] if args.query else list(group.get("queries", []))
             if args.add_query and not args.query:
                 queries = list(dict.fromkeys([*queries, *search["additional_queries"]]))
@@ -301,6 +310,10 @@ def main(argv: list[str] | None = None) -> int:
             if not queries:
                 continue
             areas = args.area if args.area is not None else [int(value) for value in (group.get("areas") or [113])]
+            if remaining_requests <= 0:
+                segments.append(ScanSegment(queries[0], areas[0], 0, "truncated", 0,
+                                            "search request budget reached"))
+                break
             pages = args.pages if args.pages is not None else int(group["max_pages"])
             remote = args.remote if args.remote is not None else bool(group.get("only_remote", False))
             days = args.days if args.days is not None else group.get("days")
@@ -308,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             group_items, group_segments = scan_many(queries, areas, pages, remote, date_from=date_from,
                                                     start_page=page, pause_seconds=1.0,
                                                     request_budget=remaining_requests)
-            remaining_requests -= sum(segment.pages for segment in group_segments)
+            remaining_requests -= sum(segment.requests for segment in group_segments)
             group_name = str(group.get("group_name") or "default")
             for item in group_items:
                 item["search_group"] = group_name
@@ -367,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"status: {status}; items: {len(all_items)}; segments: {len(segments)}; snapshot: {path}")
         for segment in segments:
             print(f"segment: query={segment.query!r} area={segment.area} pages={segment.pages} "
-                  f"status={segment.status} items={segment.items}")
+                  f"requests={segment.requests} status={segment.status} items={segment.items}")
         return 0 if status in {"ok", "empty", "truncated"} else 2
     if args.command in {"plan", "apply"}:
         items = load_items(args.input)
@@ -456,9 +469,9 @@ def main(argv: list[str] | None = None) -> int:
         for result in results:
             print(result)
         return 0
-    if args.command == "llm":
+    if args.command in {"llm", "letter"}:
         items = load_items(args.input)
-        if args.llm_action == "rerank":
+        if getattr(args, "llm_action", None) == "rerank":
             if not args.enable:
                 print("rerank is disabled by default; pass --enable explicitly", file=sys.stderr)
                 return 2
@@ -468,7 +481,11 @@ def main(argv: list[str] | None = None) -> int:
             except ConfigError as exc:
                 print(f"invalid search configuration: {exc}", file=sys.stderr)
                 return 2
-            profile = _profile(config, search)
+            try:
+                profile = _profile(config, search)
+            except ConfigError as exc:
+                print(f"invalid profile: {exc}", file=sys.stderr)
+                return 2
             ranked = filter_candidates(items, profile, min(args.limit, 20), int(search.get("min_score", 0)))
             try:
                 result, source = rerank([item.to_dict() for item in ranked], profile,
@@ -484,10 +501,11 @@ def main(argv: list[str] | None = None) -> int:
         if not item:
             print(f"vacancy id not found: {args.id}", file=sys.stderr)
             return 1
-        profile = _profile(config)
-        model = str(profile.get("llm", {}).get("model", "openrouter/free"))
-        text, source = generate(item, profile, config.data_dir / "llm-cache", model,
-                                enabled=bool(profile.get("llm", {}).get("enabled", False)))
+        try:
+            text, source = _prepare_cover_letter(config, item, _profile(config))
+        except (ConfigError, RuntimeError) as exc:
+            print(f"cover letter unavailable: {exc}", file=sys.stderr)
+            return 2 if isinstance(exc, ConfigError) else 3
         print(f"source: {source}\n{text}")
         return 0
     if args.command == "history":
@@ -518,14 +536,19 @@ def main(argv: list[str] | None = None) -> int:
                 print("--pages must be positive", file=sys.stderr)
                 return 2
             sync_store = Store(config.db_path)
-            rows = sync_statuses(session_path, sync_store, account=account, max_pages=args.pages)
-            reconciled = sync_store.reconcile_unknowns_from_negotiations(account)
+            with sync_store.run_lock():
+                sync_store.recover_interrupted_runs(account)
+                rows = sync_statuses(session_path, sync_store, account=account, max_pages=args.pages)
+                reconciled = sync_store.reconcile_unknowns_from_negotiations(account)
+                snapshot = sync_store.latest_sync(account)
         except SyncError as exc:
             print(f"sync: error ({exc})", file=sys.stderr)
             return 3
         output = args.output or _default_artifact(config, "reports", "json")
-        _write_private_json(output, {"account": account, "rows": rows, "reconciled_unknown": reconciled})
-        print(f"sync: {len(rows)} statuses; messages=disabled")
+        status = snapshot["status"] if snapshot else "unknown"
+        _write_private_json(output, {"account": account, "status": status, "rows": rows,
+                                    "reconciled_unknown": reconciled})
+        print(f"sync: {status}; {len(rows)} statuses; messages=disabled")
         print(f"reconciled_unknown: {len(reconciled)}"
               + (f" ({','.join(reconciled)})" if reconciled else ""))
         print(f"sync_report: {output}")
@@ -592,6 +615,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     """Execute explicitly requested browser submissions with auditable stop conditions."""
     try:
         profile = _profile(config, effective_search(config.load_search(), None))
+        letter_enabled = letter_mode(profile) != "off"
     except ConfigError as exc:
         print(f"invalid search configuration: {exc}", file=sys.stderr)
         return 2
@@ -630,6 +654,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     exit_code = 0
     confirmed_successes = 0
     with store.run_lock():
+        store.recover_interrupted_runs(account)
         store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
         browser = None
         context = None
@@ -642,8 +667,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
             )
             page = context.new_page()
             for index, item in enumerate(selected, 1):
-                llm_cfg = profile.get("llm", {}) or {}
-                preflight_error = _submission_preflight(item, bool(llm_cfg.get("enabled")))
+                preflight_error = _submission_preflight(item, letter_enabled)
                 if preflight_error:
                     store.record(item, "needs_manual", preflight_error, run_id, account)
                     print(f"{item.get('id')}: needs_manual — {preflight_error}")
@@ -658,12 +682,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         break
                     continue
                 cover_letter = ""
-                if llm_cfg.get("enabled"):
-                    cover_letter, source = generate(
-                        item, profile, config.data_dir / "llm-cache", str(llm_cfg.get("model", "")),
-                        enabled=True, required=True,
-                    )
-                    item["llm_source"] = source
+                if letter_enabled:
+                    try:
+                        cover_letter, source = _prepare_cover_letter(config, item, profile)
+                    except (Exception, KeyboardInterrupt):
+                        store.record(item, "failed_before_submit", "cover letter generation failed",
+                                     run_id, account)
+                        raise
+                    item["cover_letter_source"] = source
+                    if source in {"generated", "cache"}:
+                        item["llm_source"] = source
                 result = apply_one(
                     page, item, str(item.get("resume", "")).strip(), cover_letter,
                     confirmation_timeout_seconds=confirmation_timeout,
@@ -698,6 +726,10 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     break
                 if index < len(selected) and delay_max:
                     time.sleep(random.uniform(delay_min, delay_max))
+        except KeyboardInterrupt:
+            run_status = "interrupted"
+            stop_reason = "run interrupted"
+            exit_code = 130
         except Exception as exc:  # noqa: BLE001 - journal the run even if browser setup fails
             run_status = "failed"
             stop_reason = f"runner error: {str(exc)[:160]}"
@@ -736,11 +768,40 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                 )
                 exit_code = 4
             store.finish_run(run_id, run_status, stop_reason)
+            store.recover_interrupted_runs(account)
     _print_run_summary(store, run_id)
     return exit_code
 
 
-def _submission_preflight(item: dict, llm_enabled: bool) -> str:
+def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple[str, str]:
+    """Prepare the same letter for preview and apply without silently enabling a fallback."""
+    mode = letter_mode(profile)
+    if mode == "off":
+        return "", "disabled"
+    prepared = load_letter_profile(profile, config.profile_path)
+    vacancy = dict(item)
+    if not vacancy.get("resume"):
+        vacancy["resume"] = choose_resume(str(vacancy.get("name", "")), prepared)
+    if mode == "template":
+        return render_template(vacancy, prepared), "template"
+    settings = prepared.get("cover_letter", {})
+    fallback = render_template(vacancy, prepared) if settings.get("fallback_to_template", False) else None
+    llm = prepared.get("llm", {})
+    if not isinstance(llm, dict) or not isinstance(llm.get("model", ""), str):
+        raise ConfigError("llm.model must be a string")
+    try:
+        text, source = generate(vacancy, prepared, config.data_dir / "llm-cache",
+                                str(llm.get("model", "")), enabled=True, required=True)
+        if not text.strip():
+            raise RuntimeError("provider returned an empty cover letter")
+        return text, source
+    except RuntimeError:
+        if fallback is not None:
+            return fallback, "template_fallback"
+        raise
+
+
+def _submission_preflight(item: dict, letter_enabled: bool) -> str:
     """Return a manual-review reason before consuming an apply reservation."""
     from .autoapply import allowed_hh_url
 
@@ -751,6 +812,6 @@ def _submission_preflight(item: dict, llm_enabled: bool) -> str:
     requires_letter = any(item.get(key) for key in (
         "cover_letter_required", "requires_cover_letter", "letter_required",
     ))
-    if requires_letter and not llm_enabled:
+    if requires_letter and not letter_enabled:
         return "required cover letter is missing"
     return ""

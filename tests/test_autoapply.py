@@ -77,7 +77,7 @@ class _Locator:
             self.page.body = self.page.body_after_response
         elif "vacancy-response-submit-popup" in self.selector:
             self.page.state = "submitted"
-            self.page.body = "Pending"
+            self.page.body = self.page.body_after_submit
 
     def fill(self, value):
         self.page.fills.append(value)
@@ -91,6 +91,7 @@ class _Page:
         self.dialog = False
         self.dialog_after_response = dialog_after_response
         self.body_after_response = body_after_response
+        self.body_after_submit = "Pending"
         self.resume_count = 1
         self.global_resume_count = 3
         self.resume_titles = ["Python", "Python", "Python"]
@@ -187,22 +188,77 @@ def test_global_resume_duplicates_do_not_make_popup_selection_ambiguous():
     assert result.status == "success"
 
 
-def test_single_preselected_resume_needs_no_resume_option():
+def test_missing_resume_option_is_manual_even_when_hh_preselected_one():
     page = _Page()
     page.resume_count = 0
 
     result = apply_one(page, _item(), "Python")
 
-    assert result.status == "success"
+    assert result.status == "needs_manual"
+    assert not any("submit-popup" in selector for selector in page.clicks)
 
 
-def test_single_visible_preselected_resume_may_differ_from_planned_title():
+def test_mismatched_single_visible_resume_is_manual():
     page = _Page()
     page.resume_titles = ["AI Agent Engineer"]
 
     result = apply_one(page, _item(), "Backend Developer")
 
+    assert result.status == "needs_manual"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
+def test_resume_title_matching_normalizes_whitespace_and_case():
+    page = _Page()
+    page.resume_titles = ["  Python   Backend\n"]
+
+    result = apply_one(page, _item(), "python backend")
+
     assert result.status == "success"
+
+
+def test_duplicate_exact_resume_titles_require_manual_selection():
+    page = _Page()
+    page.resume_count = 2
+    page.resume_titles = ["Python", " Python "]
+
+    result = apply_one(page, _item(), "python")
+
+    assert result.status == "needs_manual"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
+def test_initial_russian_captcha_stops_before_first_action():
+    page = _Page()
+    page.body = "Требуется капча"
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "needs_manual"
+    assert result.note == "CAPTCHA detected"
+    assert page.clicks == []
+
+
+def test_russian_captcha_after_first_action_stops_before_submit():
+    page = _Page(dialog_after_response=False, body_after_response="Требуется капча")
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "unknown"
+    assert "captcha" in result.note.lower()
+    assert sum("vacancy-response-link" in selector for selector in page.clicks) == 1
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
+def test_captcha_after_submit_is_unknown_and_not_retryable():
+    page = _Page()
+    page.body_after_submit = "Требуется капча"
+    page.confirm_after_reads = 999
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "unknown"
+    assert result.note == "CAPTCHA detected after submission"
 
 
 def test_delayed_confirmation_is_polled_before_unknown():

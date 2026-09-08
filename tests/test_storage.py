@@ -1,4 +1,7 @@
 import csv
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from applypilot.storage import Store
 
@@ -106,3 +109,105 @@ def test_negotiation_reconciles_unknown_without_replaying_the_run(tmp_path):
     assert summary["run"]["status"] == "stopped_reconciled"
     assert summary["counts"] == {"prepared": 1, "success": 1}
     assert store.reconcile_unknowns_from_negotiations("account") == []
+
+
+def test_negotiation_snapshot_isolated_by_account_and_complete_empty_clears_only_owner(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    store.replace_negotiation_statuses(
+        [{"vacancy_id": "same", "status": "not_viewed"}], "first", complete=True
+    )
+    store.replace_negotiation_statuses(
+        [{"vacancy_id": "same", "status": "viewed"}], "second", complete=True
+    )
+
+    store.replace_negotiation_statuses([], "first", complete=True)
+
+    with store.connect() as conn:
+        rows = conn.execute(
+            "SELECT account,vacancy_id,status FROM negotiation_statuses ORDER BY account"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("second", "same", "viewed")]
+
+
+def test_partial_negotiation_snapshot_preserves_rows_outside_fetched_page(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    store.replace_negotiation_statuses(
+        [
+            {"vacancy_id": "one", "status": "not_viewed"},
+            {"vacancy_id": "two", "status": "viewed"},
+        ],
+        "account",
+        complete=True,
+    )
+
+    store.replace_negotiation_statuses(
+        [{"vacancy_id": "one", "status": "invitation"}], "account", complete=False
+    )
+
+    with store.connect() as conn:
+        rows = conn.execute(
+            "SELECT vacancy_id,status FROM negotiation_statuses "
+            "WHERE account=? ORDER BY vacancy_id",
+            ("account",),
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("one", "invitation"),
+        ("two", "viewed"),
+    ]
+
+
+def test_reconciliation_requires_known_fresh_negotiation_evidence(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    store.record({"id": "stale"}, "unknown", run_id="run", account="account")
+    store.record({"id": "unrecognized"}, "unknown", run_id="run", account="account")
+    store.replace_negotiation_statuses(
+        [
+            {"vacancy_id": "stale", "status": "not_viewed"},
+            {"vacancy_id": "unrecognized", "status": "mystery"},
+        ],
+        "account",
+        complete=True,
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE negotiation_statuses SET fetched_at='2000-01-01T00:00:00+00:00' "
+            "WHERE account=? AND vacancy_id=?",
+            ("account", "stale"),
+        )
+
+    assert store.reconcile_unknowns_from_negotiations("account") == []
+    assert store.statuses("account") == {"stale": "unknown", "unrecognized": "unknown"}
+
+
+def test_recover_interrupted_runs_requires_run_lock_and_is_idempotent(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    item = {"id": "one", "name": "A"}
+    store.start_run("abandoned", "account", "apply", tmp_path / "input.json", 1, [item])
+    assert store.reserve(item, "abandoned", per_run=1, per_day=1, account="account")[0]
+
+    with pytest.raises(RuntimeError, match="run lock"):
+        store.recover_interrupted_runs("account")
+
+    with store.run_lock():
+        assert store.recover_interrupted_runs("account") == ["one"]
+    summary = store.run_summary("abandoned")
+    assert summary is not None
+    assert summary["run"]["status"] != "running"
+    assert "interrupted" in summary["run"]["stop_reason"]
+    assert summary["counts"] == {"unknown": 1}
+    assert store.statuses("account")["one"] == "unknown"
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events WHERE account=? AND vacancy_id=? AND status='unknown'",
+            ("account", "one"),
+        ).fetchone()[0] == 1
+
+    with store.run_lock():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(store.recover_interrupted_runs, "account")
+            with pytest.raises(RuntimeError, match="run lock"):
+                future.result()
+        assert store.recover_interrupted_runs("account") == []
+    with store.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2

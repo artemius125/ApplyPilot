@@ -26,6 +26,7 @@ class ScanResult:
     page: int | None = None
     total: int | None = None
     attempts: int = 1
+    requests: int = 1
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,22 @@ class ScanSegment:
     status: str
     items: int
     error: str = ""
+    requests: int = 0
+
+
+class _BudgetExhausted(Exception):
+    pass
+
+
+@dataclass
+class _RequestBudget:
+    limit: int | None
+    used: int = 0
+
+    def consume(self) -> None:
+        if self.limit is not None and self.used >= self.limit:
+            raise _BudgetExhausted
+        self.used += 1
 
 
 def _state(html: str) -> dict[str, Any] | None:
@@ -43,7 +60,8 @@ def _state(html: str) -> dict[str, Any] | None:
     if not template:
         return None
     try:
-        return json.loads(template.decode_contents())
+        state = json.loads(template.decode_contents())
+        return state if isinstance(state, dict) else None
     except json.JSONDecodeError:
         return None
 
@@ -99,7 +117,8 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
 
 def scan(query: str, area: int = 113, page: int = 0, only_remote: bool = False,
          timeout: float = 20.0, session: requests.Session | None = None,
-         date_from: str | None = None, max_attempts: int = 2) -> ScanResult:
+         date_from: str | None = None, max_attempts: int = 2,
+         request_budget: int | None = None) -> ScanResult:
     params: dict[str, Any] = {"text": query, "area": area, "page": page,
                               "items_on_page": 50, "search_field": "vacancy_name",
                               "order_by": "relevance"}
@@ -108,22 +127,29 @@ def scan(query: str, area: int = 113, page: int = 0, only_remote: bool = False,
     if date_from:
         params["date_from"] = date_from
     client = session or requests.Session()
+    budget = _RequestBudget(request_budget)
     attempts = max(1, min(int(max_attempts), 2))
     for attempt in range(1, attempts + 1):
         try:
             response, redirect_error = _get_hh(client, "https://hh.ru/search/vacancy", params=params,
-                                                timeout=timeout)
+                                                timeout=timeout, budget=budget)
+        except _BudgetExhausted:
+            return ScanResult([], "truncated", "hh.ru", "search request budget reached", query, area,
+                              page, attempts=attempt, requests=budget.used)
         except requests.RequestException:
-            if attempt < attempts:
+            if attempt < attempts and (budget.limit is None or budget.used < budget.limit):
                 time.sleep(1)
                 continue
-            return ScanResult([], "failed", "hh.ru", "network error", query, area, page, attempts=attempt)
+            return ScanResult([], "failed", "hh.ru", "network error", query, area, page,
+                              attempts=attempt, requests=budget.used)
         if redirect_error:
-            return ScanResult([], "failed", "hh.ru", redirect_error, query, area, page, attempts=attempt)
+            return ScanResult([], "failed", "hh.ru", redirect_error, query, area, page,
+                              attempts=attempt, requests=budget.used)
         if response.status_code == 403:
-            return ScanResult([], "failed", "hh.ru", "HTTP 403 access limited", query, area, page, attempts=attempt)
+            return ScanResult([], "failed", "hh.ru", "HTTP 403 access limited", query, area, page,
+                              attempts=attempt, requests=budget.used)
         if response.status_code == 429 or response.status_code >= 500:
-            if attempt < attempts:
+            if attempt < attempts and (budget.limit is None or budget.used < budget.limit):
                 retry_after = response.headers.get("Retry-After", "1")
                 try:
                     delay = min(10.0, max(1.0, float(retry_after)))
@@ -131,18 +157,26 @@ def scan(query: str, area: int = 113, page: int = 0, only_remote: bool = False,
                     delay = 1.0
                 time.sleep(delay)
                 continue
-            return ScanResult([], "failed", "hh.ru", f"HTTP {response.status_code}", query, area, page, attempts=attempt)
+            return ScanResult([], "failed", "hh.ru", f"HTTP {response.status_code}", query, area, page,
+                              attempts=attempt, requests=budget.used)
         if response.status_code != 200:
-            return ScanResult([], "failed", "hh.ru", f"HTTP {response.status_code}", query, area, page, attempts=attempt)
+            return ScanResult([], "failed", "hh.ru", f"HTTP {response.status_code}", query, area, page,
+                              attempts=attempt, requests=budget.used)
         state = _state(response.text)
         if state is None:
-            status = "captcha" if "captcha" in response.text.lower() else "failed"
-            return ScanResult([], status, "hh.ru", "HH-Lux-InitialState not found", query, area, page, attempts=attempt)
-        result = state.get("vacancySearchResult") or {}
-        items = [_normalize(item) for item in result.get("vacancies") or []]
+            status = "captcha" if any(marker in response.text.lower() for marker in ("captcha", "капч")) else "failed"
+            return ScanResult([], status, "hh.ru", "HH-Lux-InitialState not found", query, area, page,
+                              attempts=attempt, requests=budget.used)
+        result = state.get("vacancySearchResult")
+        if (not isinstance(result, dict) or not isinstance(result.get("vacancies"), list)
+                or any(not isinstance(item, dict) for item in result["vacancies"])):
+            return ScanResult([], "failed", "hh.ru", "unrecognized vacancy search structure", query,
+                              area, page, attempts=attempt, requests=budget.used)
+        items = [_normalize(item) for item in result["vacancies"]]
         return ScanResult(items, "ok" if items else "empty", "hh.ru", "", query, area, page,
-                          int(result.get("totalResults") or 0), attempt)
-    return ScanResult([], "failed", "hh.ru", "request budget exhausted", query, area, page, attempts=attempts)
+                          int(result.get("totalResults") or 0), attempt, budget.used)
+    return ScanResult([], "failed", "hh.ru", "request budget exhausted", query, area, page,
+                      attempts=attempts, requests=budget.used)
 
 
 def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
@@ -182,6 +216,7 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
             segment_status = "empty"
             segment_error = ""
             pages_used = 0
+            requests_used = 0
             for page in range(start_page, start_page + pages):
                 if remaining_requests is not None and remaining_requests <= 0:
                     segment_status = "truncated"
@@ -191,11 +226,13 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                     elapsed = time.monotonic() - last_request_at
                     if elapsed < pause_seconds:
                         time.sleep(pause_seconds - elapsed)
-                result = scan(query, area, page, only_remote, session=client, date_from=date_from)
+                result = scan(query, area, page, only_remote, session=client, date_from=date_from,
+                              request_budget=remaining_requests)
                 last_request_at = time.monotonic()
                 pages_used += 1
+                requests_used += result.requests
                 if remaining_requests is not None:
-                    remaining_requests -= 1
+                    remaining_requests -= result.requests
                 fetched += len(result.items)
                 segment_status = result.status
                 segment_error = result.error
@@ -215,7 +252,7 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                     result.total is not None and pages_used * 50 < result.total):
                 segment_status = "truncated"
             segments.append(ScanSegment(query, area, pages_used, segment_status,
-                                        fetched, segment_error))
+                                        fetched, segment_error, requests_used))
             if segment_status in {"failed", "captcha"}:
                 aborted = True
     return list(unique.values()), segments
@@ -228,13 +265,16 @@ def _is_hh_url(url: str) -> bool:
 
 
 def _get_hh(client: requests.Session, url: str, *, params: dict[str, Any] | None = None,
-            timeout: float = 20.0, max_redirects: int = 3) -> tuple[Any, str]:
+            timeout: float = 20.0, max_redirects: int = 3,
+            budget: _RequestBudget | None = None) -> tuple[Any, str]:
     """Request an HH page while refusing to contact an external redirect target."""
     current_url = url
     current_params = params
     if not _is_hh_url(current_url):
         return None, "invalid HH URL"
     for _ in range(max_redirects + 1):
+        if budget is not None:
+            budget.consume()
         response = client.get(current_url, params=current_params, timeout=timeout,
                               headers={"User-Agent": "ApplyPilot/0.1"}, allow_redirects=False)
         current_params = None
@@ -332,7 +372,7 @@ def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(temp_name, path)
-        if status in {"ok", "truncated"}:
+        if status == "ok" or (status == "truncated" and items):
             pointer = directory / "last_successful.json"
             pointer_temp = directory / ".last_successful.tmp"
             pointer_temp.write_text(path.name, encoding="utf-8")
