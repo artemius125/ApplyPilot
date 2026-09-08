@@ -1,0 +1,26 @@
+name = "Example Candidate"
+location = "Remote"
+english_level = "technical reading"
+profile_version = "example-1"
+reviewed = false
+
+[limits]
+per_run = 5
+per_day = 20
+
+[llm]
+enabled = false
+model = "openrouter/free"
+prompt_version = "1"
+
+[resumes]
+default = "AI Agent Engineer"
+ai_agent = "AI Agent Engineer"
+ml = "ML Engineer"
+python = "Python Backend"
+go = "Go Backend"
+
+[answers]
+motivation = "Describe your motivation here."
+salary = "Discussed individually."
+english = "Technical reading and written communication."

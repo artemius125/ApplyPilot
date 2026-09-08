@@ -1,0 +1,17 @@
+preset = "ai-llm"
+queries = ["AI Agent Engineer", "LLM Engineer", "Python Backend"]
+areas = [113]
+max_pages = 1
+only_remote = true
+days = 7
+min_score = 50
+skip_high_security = false
+details_limit = 50
+
+[salary]
+currency = "RUR"
+from = 0
+missing = "include"
+
+[experience]
+allowed = ["noExperience", "between1And3", "between3And6"]

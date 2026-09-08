@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "items": [
+    {
+      "vacancyId": "fixture-1",
+      "name": "AI Agent Engineer",
+      "company": {"visibleName": "Example Labs"},
+      "compensation": {"from": 100000, "currencyCode": "RUR"},
+      "workExperience": "between1And3",
+      "area": {"name": "Красноярск"},
+      "@workSchedule": "remote",
+      "workFormats": [{"workFormatsElement": ["remote"]}],
+      "snippet": {"requirement": "Python and LLM", "responsibility": "Build agents"},
+      "url": "https://hh.ru/vacancy/fixture-1"
+    }
+  ]
+}
