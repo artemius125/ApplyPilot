@@ -40,6 +40,11 @@ class _Locator:
     def inner_text(self, timeout=None):
         return self.page.body
 
+    def get_attribute(self, name):
+        if name == "href" and "vacancy-response-link" in self.selector:
+            return self.page.response_href
+        return None
+
     def click(self, timeout=None):
         self.page.clicks.append(self.selector)
         if "vacancy-response-link" in self.selector:
@@ -65,6 +70,7 @@ class _Page:
         self.resume_visible = True
         self.question_count = 0
         self.resume_filter = ""
+        self.response_href = ""
         self.clicks = []
         self.fills = []
 
@@ -152,6 +158,17 @@ def test_external_navigation_is_manual_not_a_substring_match():
     result = apply_one(page, _item(), "Python")
 
     assert result.status == "needs_manual"
+    assert page.clicks == []
+
+
+def test_external_response_link_is_manual_before_the_first_click():
+    page = _Page()
+    page.response_href = "https://ats.example/apply"
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "needs_manual"
+    assert result.note == "application action points to an external ATS"
     assert page.clicks == []
 
 
