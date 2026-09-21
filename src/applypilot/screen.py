@@ -182,7 +182,8 @@ def parse_verdict(content: str) -> dict[str, Any]:
     return {"verdict": verdict, "fit_score": fit_score, "reason": str(data.get("reason", ""))[:400]}
 
 
-def screen_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str, track: str) -> str:
+def screen_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str, track: str,
+                     rubric: str = "") -> str:
     value = {
         "id": str(item.get("id", "")),
         "name": item.get("name", ""),
@@ -191,6 +192,9 @@ def screen_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str
         "candidate": candidate,
         "model": model,
         "track": track,
+        # The rubric (built-in + user criteria) is part of the verdict input, so
+        # editing criteria must invalidate cached verdicts.
+        "rubric": rubric,
         "prompt_version": SCREEN_PROMPT_VERSION,
     }
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -298,7 +302,7 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
                 "experience": item.get("experience", ""), "salary": item.get("salary"),
                 "area": item.get("area", ""), "schedule": item.get("schedule", ""),
                 "published": item.get("published", "")}
-        path = cache_dir / f"screen-{screen_cache_key(item, candidate, model, track)}.json"
+        path = cache_dir / f"screen-{screen_cache_key(item, candidate, model, track, rubric)}.json"
         if path.exists():
             try:
                 cached = json.loads(path.read_text(encoding="utf-8"))

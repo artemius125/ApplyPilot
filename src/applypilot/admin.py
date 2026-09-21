@@ -42,23 +42,89 @@ EXPERIENCE_LABELS = {
 # Tiers that exceed the candidate's real experience — flagged in the UI.
 OVER_EXPERIENCE = {"between3And6", "moreThan6"}
 
-# track -> the profile/search/snapshot artifacts that our two-track setup uses.
-TRACKS = {
-    "ai": {
-        "label": "AI / LLM",
-        "profile": "private/config/profile.toml",
-        "search": "private/config/search.toml",
-        "screen_report": "private/reports/screen-ai.json",
-        "accepted": "private/data/snapshots/accepted-ai.json",
-    },
-    "infra": {
-        "label": "DevOps / инфраструктура",
-        "profile": "private/config/profile-infra.toml",
-        "search": "private/config/search-infra.toml",
-        "screen_report": "private/reports/screen-infra.json",
-        "accepted": "private/data/snapshots/accepted-infra.json",
-    },
-}
+TRACKS_CONFIG = "private/config/tracks.toml"
+RUBRIC_TYPES = ("ai", "infra", "general")
+
+# Fallback used only when private/config/tracks.toml is absent; it is written to
+# disk on first load so the operator can edit / add tracks there.
+DEFAULT_TRACKS = [
+    {"key": "ai", "label": "AI / LLM", "type": "ai",
+     "profile": "private/config/profile.toml", "search": "private/config/search.toml",
+     "resume": "AI/LLM Engineer"},
+    {"key": "infra", "label": "DevOps / инфраструктура", "type": "infra",
+     "profile": "private/config/profile-infra.toml", "search": "private/config/search-infra.toml",
+     "resume": "DevOps / Infrastructure Engineer"},
+]
+
+# track key -> normalised track config; populated by load_tracks() so the number
+# of tracks (and their resumes) is driven by config, not hard-coded.
+TRACKS: dict[str, dict[str, Any]] = {}
+
+
+def _normalise_track(entry: dict[str, Any]) -> dict[str, Any] | None:
+    key = re.sub(r"[^a-z0-9_-]", "", str(entry.get("key", "")).strip().lower())
+    if not key:
+        return None
+    rubric = str(entry.get("type", "general")).strip().lower()
+    if rubric not in RUBRIC_TYPES:
+        rubric = "general"
+    return {
+        "key": key,
+        "label": str(entry.get("label") or key),
+        "type": rubric,
+        "profile": str(entry.get("profile") or f"private/config/profile-{key}.toml"),
+        "search": str(entry.get("search") or f"private/config/search-{key}.toml"),
+        "resume": str(entry.get("resume") or ""),
+        "screen_report": str(entry.get("screen_report") or f"private/reports/screen-{key}.json"),
+        "accepted": str(entry.get("accepted") or f"private/data/snapshots/accepted-{key}.json"),
+    }
+
+
+def load_tracks(root: Path) -> dict[str, dict[str, Any]]:
+    """Load track definitions from tracks.toml into the module TRACKS mapping.
+
+    Missing config falls back to the built-in two tracks and is written out so
+    the file becomes the single, editable source of truth.
+    """
+    path = root / TRACKS_CONFIG
+    entries: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            with path.open("rb") as fh:
+                data = tomllib.load(fh)
+            raw = data.get("track", [])
+            if isinstance(raw, list):
+                entries = [e for e in raw if isinstance(e, dict)]
+        except (OSError, tomllib.TOMLDecodeError):
+            entries = []
+    if not entries:
+        entries = [dict(e) for e in DEFAULT_TRACKS]
+        try:
+            _write_tracks_config(path, entries)
+        except OSError:
+            pass
+    TRACKS.clear()
+    for entry in entries:
+        norm = _normalise_track(entry)
+        if norm is not None:
+            TRACKS[norm["key"]] = norm
+    return TRACKS
+
+
+def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
+    """Persist track definitions to tracks.toml (append-safe, minimal writer)."""
+    lines = ["# Треки поиска для админки. Число треков динамическое.",
+             "# key/type(ai|infra|general)/profile/search/resume — см. админку «Резюме и треки».", ""]
+    for e in entries:
+        n = _normalise_track(e)
+        if n is None:
+            continue
+        lines.append("[[track]]")
+        for field_name in ("key", "label", "type", "profile", "search", "resume"):
+            lines.append(f'{field_name} = {json.dumps(n[field_name], ensure_ascii=False)}')
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 # Model choices offered in the admin (the first is the stock default).
@@ -157,6 +223,32 @@ def _profile_flag(root: Path, track: str) -> dict[str, Any]:
         return {}
 
 
+_RESUME_STOP = {"мои резюме", "создать резюме", "резюме", "показать ещё", "показать еще"}
+_RESUME_SKIP_PREFIX = ("уровень дохода", "постоянная работа", "проектная работа", "стажировка",
+                       "частичная занятость", "удалённо", "удаленно", "гибрид", "обновлено")
+
+
+def _clean_resume_titles(raw: list[str]) -> list[str]:
+    """Reduce HH's noisy resume labels (card blocks, headings) to clean titles."""
+    out: list[str] = []
+    for entry in raw:
+        for line in str(entry).split("\n"):
+            s = line.strip()
+            low = s.lower()
+            if not s or low in _RESUME_STOP or low.startswith(_RESUME_SKIP_PREFIX):
+                continue
+            out.append(s)
+            break  # first meaningful line of a block is the resume title
+    seen: set[str] = set()
+    result: list[str] = []
+    for title in out:
+        key = title.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(title)
+    return result
+
+
 def _exp_label(value: str) -> str:
     return EXPERIENCE_LABELS.get(str(value or ""), "—")
 
@@ -240,6 +332,8 @@ class AdminApp:
         self.runner = JobRunner(self.root)
         self.settings_path = config.data_dir / "admin-settings.json"
         self._balance_cache: tuple[float, float | None] = (0.0, None)  # (fetched_at, rub)
+        self._resume_cache: dict[str, Any] = {}  # last-known HH resume titles
+        load_tracks(self.root)
 
     # ---- settings (model + per-user API key) ---------------------------
     def load_settings(self) -> dict[str, Any]:
@@ -249,6 +343,7 @@ class AdminApp:
     def settings_public(self) -> dict[str, Any]:
         """Settings for the browser — the API key is NEVER returned, only whether it is set."""
         s = self.load_settings()
+        criteria = {key: s.get(f"criteria_{key}") or "" for key in TRACKS}
         return {
             "model": s.get("model") or DEFAULT_MODEL,
             "base_url": s.get("base_url") or DEFAULT_BASE_URL,
@@ -256,8 +351,10 @@ class AdminApp:
             "models": MODEL_CHOICES,
             "constraints": s.get("constraints") or "",
             "salary_expectation": s.get("salary_expectation") or "",
-            "criteria_ai": s.get("criteria_ai") or "",
-            "criteria_infra": s.get("criteria_infra") or "",
+            # Per-track screening overrides, plus a list of tracks for the UI.
+            "criteria": criteria,
+            "tracks": [{"key": k, "label": v["label"], "type": v["type"], "resume": v["resume"]}
+                       for k, v in TRACKS.items()],
         }
 
     def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -267,7 +364,8 @@ class AdminApp:
         if patch.get("base_url"):
             s["base_url"] = str(patch["base_url"]).strip()
         # Free-text prompt/candidate overrides ("" clears them).
-        for fld in ("constraints", "salary_expectation", "criteria_ai", "criteria_infra"):
+        fields = ["constraints", "salary_expectation"] + [f"criteria_{key}" for key in TRACKS]
+        for fld in fields:
             if fld in patch and isinstance(patch[fld], str):
                 s[fld] = patch[fld].strip()
         # Only overwrite the key when a non-empty value is supplied; "" leaves it as is.
@@ -439,7 +537,7 @@ class AdminApp:
         elif action == "screen":
             argv = base + gflags + [
                 "screen", "--input", body.get("input") or _track_snapshot(self.root, track),
-                "--track", track,
+                "--track", cfg["type"],
                 "--output", cfg["screen_report"], "--emit-snapshot", cfg["accepted"],
             ]
             s = self.load_settings()
@@ -461,7 +559,7 @@ class AdminApp:
             import shlex
             days = max(1, int(body.get("days") or 3))
             s = self.load_settings()
-            screen_extra = ["--track", track, "--output", cfg["screen_report"],
+            screen_extra = ["--track", cfg["type"], "--output", cfg["screen_report"],
                             "--emit-snapshot", cfg["accepted"]]
             if str(s.get("model") or "").strip():
                 screen_extra += ["--model", str(s["model"]).strip()]
@@ -530,6 +628,124 @@ class AdminApp:
         return {"text": res.get("text", ""), "source": res.get("source", ""),
                 "url": item.get("url", ""), "name": item.get("name", "")}
 
+    # ---- resumes & tracks ----------------------------------------------
+    def fetch_resumes(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Read active HH resume titles.
+
+        The live HH read (Playwright, ~10s) runs only on ``refresh``; otherwise
+        the last-known result is returned so the tab opens instantly.
+        """
+        if not refresh:
+            return self._resume_cache or {"auth_status": "unknown", "resume_titles": [], "error": ""}
+        session_path = self.config.data_dir / "hh_session.json"
+        result: dict[str, Any] = {"auth_status": "unknown", "resume_titles": [], "error": ""}
+        if not session_path.exists():
+            result["error"] = "нет сессии HH (сделай login)"
+            return result
+        try:
+            from .inspection import inspect_resumes
+            data = inspect_resumes(session_path)
+            result["auth_status"] = data.get("auth_status", "unknown")
+            result["resume_titles"] = _clean_resume_titles(list(data.get("resume_titles", [])))
+        except RuntimeError as exc:  # playwright missing / read-only failure
+            result["error"] = str(exc)[:200]
+        except Exception as exc:  # noqa: BLE001 - a browser read failure is reported, not fatal
+            result["error"] = f"не удалось прочитать резюме: {str(exc)[:160]}"
+        if result["resume_titles"] or not self._resume_cache:
+            self._resume_cache = result
+        return result
+
+    def tracks_overview(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Tracks joined with active HH resumes, flagging mismatches both ways."""
+        resumes = self.fetch_resumes(refresh=refresh)
+        titles = [str(t).strip() for t in resumes.get("resume_titles", [])]
+        title_set = {t.lower() for t in titles}
+        used = set()
+        tracks = []
+        for key, cfg in TRACKS.items():
+            wanted = str(cfg.get("resume") or "").strip()
+            present = wanted.lower() in title_set if wanted else None
+            if present:
+                used.add(wanted.lower())
+            tracks.append({"key": key, "label": cfg["label"], "type": cfg["type"],
+                           "resume": wanted, "profile": cfg["profile"], "search": cfg["search"],
+                           "resume_present": present})
+        unassigned = [t for t in titles if t.lower() not in {str(c.get("resume", "")).strip().lower()
+                                                              for c in TRACKS.values()}]
+        return {"tracks": tracks, "hh_resumes": titles, "unassigned_resumes": unassigned,
+                "auth_status": resumes.get("auth_status"), "error": resumes.get("error", ""),
+                "rubric_types": list(RUBRIC_TYPES)}
+
+    def add_track(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Scaffold a new track (config entry + profile/search skeletons)."""
+        key = re.sub(r"[^a-z0-9_-]", "", str(body.get("key", "")).strip().lower())
+        if not key:
+            return {"error": "ключ трека обязателен (латиница, цифры, _-)"}
+        if key in TRACKS:
+            return {"error": f"трек «{key}» уже существует"}
+        rubric = str(body.get("type", "general")).strip().lower()
+        if rubric not in RUBRIC_TYPES:
+            rubric = "general"
+        label = str(body.get("label") or key).strip()
+        resume = str(body.get("resume") or "").strip()
+        queries = [q.strip() for q in re.split(r"[\n,;]+", str(body.get("queries", ""))) if q.strip()]
+        entry = {"key": key, "label": label, "type": rubric, "resume": resume,
+                 "profile": f"private/config/profile-{key}.toml",
+                 "search": f"private/config/search-{key}.toml"}
+        try:
+            self._scaffold_profile(self.root / entry["profile"], resume)
+            self._scaffold_search(self.root / entry["search"], queries)
+            entries = [dict(v) for v in TRACKS.values()] + [entry]
+            _write_tracks_config(self.root / TRACKS_CONFIG, entries)
+        except OSError as exc:
+            return {"error": f"не удалось создать файлы трека: {str(exc)[:160]}"}
+        # Reload first so the new key is a recognised settings field, then save
+        # any per-track screening criteria supplied with the form.
+        load_tracks(self.root)
+        criteria = str(body.get("criteria") or "").strip()
+        if criteria:
+            self.save_settings({f"criteria_{key}": criteria})
+        return {"ok": True, "key": key, "profile": entry["profile"], "search": entry["search"],
+                "note": "Заполни [professional] в профиле данными из резюме (PDF) и проверь запросы."}
+
+    def _scaffold_profile(self, path: Path, resume: str) -> None:
+        if path.exists():
+            return
+        rt = json.dumps(resume or "ЗАПОЛНИ: точное название резюме на HH", ensure_ascii=False)
+        text = (
+            '# Профиль нового трека. Заполни [professional] данными из резюме (PDF),\n'
+            '# проверь [resumes] (точное название резюме на HH) и лимиты. reviewed=false.\n'
+            'name = "Артём Остапов"\nlocation = "Москва"\nenglish_level = "B1"\n'
+            'reviewed = false\naccount = "hh-primary"\n\n'
+            '[limits]\nper_run = 15\nper_day = 40\n\n'
+            '[apply]\ndelay_min_seconds = 20\ndelay_max_seconds = 45\n'
+            'long_pause_every = 8\nlong_pause_min_seconds = 60\nlong_pause_max_seconds = 150\n\n'
+            '[screen]\nmodel = "gpt-5-mini"\n'
+            'base_url = "https://api.aitunnel.ru/v1/chat/completions"\nconcurrency = 6\n\n'
+            '[cover_letter]\nmode = "off"\n\n'
+            '[professional]\n# ЗАПОЛНИ из резюме/PDF: summary, skills, [[professional.experience]].\n'
+            'summary = ""\nskills = []\n\n'
+            f'[resumes]\ndefault = {rt}\n'
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _scaffold_search(self, path: Path, queries: list[str]) -> None:
+        if path.exists():
+            return
+        q = queries or ["ЗАПОЛНИ запрос"]
+        q_toml = "[\n" + "".join(f'  {json.dumps(x, ensure_ascii=False)},\n' for x in q) + "]"
+        text = (
+            '# Поисковая конфигурация нового трека. Проверь запросы, регион и фильтры.\n'
+            f'queries = {q_toml}\n'
+            'area = [1, 2]  # Москва + СПб; для всей России добавь регионы или используй remote\n'
+            'only_remote = true\ndays = 14\nmin_score = 40\n\n'
+            '[salary]\nfrom = 0\nmissing = "include"\n\n'
+            '[experience]\nallowed = ["noExperience", "between1And3"]\n'
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
 
 def _track_queries(root: Path, track: str) -> set[str]:
     cfg = TRACKS[track]
@@ -582,6 +798,9 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.settings_public())
             elif parsed.path == "/api/stats":
                 self._send(200, {"spend": app.spend(), "verdicts": app.verdict_stats()})
+            elif parsed.path == "/api/resumes":
+                refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
+                self._send(200, app.tracks_overview(refresh=refresh))
             else:
                 self._send(404, {"error": "not found"})
 
@@ -599,6 +818,9 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/api/letter":
                 b = body if isinstance(body, dict) else {}
                 self._send(200, app.letter(str(b.get("track", "ai")), str(b.get("id", ""))))
+            elif parsed.path == "/api/track":
+                res = app.add_track(body if isinstance(body, dict) else {})
+                self._send(200 if res.get("ok") else 400, res)
             else:
                 self._send(404, {"error": "not found"})
 
@@ -631,6 +853,8 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
         print("\nstopping admin")
     finally:
         server.server_close()
+
+
 
 
 
@@ -687,6 +911,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <div class="tab" data-t="vac">Вакансии</div>
 <div class="tab" data-t="apply">Отклики</div>
 <div class="tab" data-t="stats">Статистика</div>
+<div class="tab" data-t="tracks">Резюме и треки</div>
 <div class="tab" data-t="log">Лог</div>
 <div class="tab" data-t="settings">Настройки</div>
 </div>
@@ -697,7 +922,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 
 <section id="vac" class="hide">
   <div class="row"><label>Трек</label>
-    <select id="vtrack"><option value="ai">AI / LLM</option><option value="infra">DevOps / инфраструктура</option></select>
+    <select id="vtrack"></select>
     <label>Вердикт</label>
     <select id="vfilter"><option value="">все</option><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>ERROR</option></select>
     <label><input type="checkbox" id="vshowskip"> показывать SKIP</label>
@@ -712,7 +937,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
   <div class="card" style="max-width:660px">
     <h3>Запуск откликов</h3>
     <div class="row"><label>Трек</label>
-      <select id="atrack"><option value="ai">AI / LLM</option><option value="infra">DevOps / инфраструктура</option></select>
+      <select id="atrack"></select>
       <label>Лимит</label><input id="alimit" type="number" value="10" style="width:80px">
       <label>Target success</label><input id="atarget" type="number" value="" placeholder="—" style="width:80px"></div>
     <div class="row"><button class="ghost" onclick="job('apply_dry')">Dry-run (безопасно)</button></div>
@@ -729,6 +954,27 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
   <div class="card" style="margin-top:12px"><h3>Вердикты по трекам</h3><div id="verdictbars"></div></div>
 </section>
 
+<section id="tracks" class="hide">
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Активные резюме на HH и треки</h3>
+    <button class="ghost mini" onclick="loadTracks(true)">Обновить с HH</button></div>
+    <p class="muted" id="tracksmeta">Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (может занять ~10с).</p>
+    <div id="trackstable"></div>
+    <div id="unassigned"></div>
+  </div>
+  <div class="card" style="margin-top:12px;max-width:680px"><h3>Добавить трек</h3>
+    <p class="muted">Создаст скелет profile-&lt;ключ&gt;.toml и search-&lt;ключ&gt;.toml. Дальше заполни в профиле блок [professional] данными из резюме (PDF) и проверь запросы.</p>
+    <div class="row"><label style="width:150px">Ключ (латиница)</label><input id="tkey" placeholder="напр. ml, backend" style="min-width:200px"></div>
+    <div class="row"><label style="width:150px">Название</label><input id="tlabel" placeholder="напр. ML Engineer" style="min-width:280px"></div>
+    <div class="row"><label style="width:150px">Рубрика</label><select id="ttype"></select></div>
+    <div class="row"><label style="width:150px">Резюме на HH</label><input id="tresume" placeholder="точное название резюме на HH" style="min-width:320px"></div>
+    <div class="row" style="align-items:flex-start"><label style="width:150px;margin-top:6px">Запросы (по строке)</label>
+      <textarea id="tqueries" rows="4" style="flex:1;min-width:280px" placeholder="LLM Engineer&#10;AI Agent Engineer&#10;RAG Engineer"></textarea></div>
+    <div class="row" style="align-items:flex-start"><label style="width:150px;margin-top:6px">Доп. правила скрининга</label>
+      <textarea id="tcriteria" rows="3" style="flex:1;min-width:280px" placeholder="необязательно"></textarea></div>
+    <div class="row"><button onclick="addTrack()">Создать трек</button><span id="tmsg" class="muted"></span></div>
+  </div>
+</section>
+
 <section id="log" class="hide"><div class="row"><button class="ghost mini" onclick="refreshJob()">Обновить</button><button class="danger mini" onclick="stopJob()">Стоп</button></div><pre id="logbox">—</pre></section>
 
 <section id="settings" class="hide">
@@ -743,10 +989,8 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <textarea id="sconstraints" rows="4" style="width:100%" placeholder="опыт, метод работы, интервью, английский, формат"></textarea>
     <div class="row" style="margin-top:8px"><label style="width:170px">Зарплатный ориентир</label></div>
     <textarea id="ssalary" rows="2" style="width:100%" placeholder="напр.: ориентир от 100 000 ₽; вилки заметно ниже неинтересны"></textarea>
-    <div class="row" style="margin-top:8px"><label style="width:170px">Доп. правила скрининга — AI</label></div>
-    <textarea id="scritai" rows="4" style="width:100%" placeholder="пусто — только встроенная рубрика AI"></textarea>
-    <div class="row" style="margin-top:8px"><label style="width:170px">Доп. правила скрининга — DevOps</label></div>
-    <textarea id="scritinfra" rows="4" style="width:100%" placeholder="пусто — только встроенная рубрика DevOps"></textarea>
+    <div class="row" style="margin-top:8px"><label style="width:170px">Доп. правила скрининга (по трекам)</label></div>
+    <div id="scrit"></div>
     <div class="row" style="margin-top:10px"><button onclick="saveSettings()">Сохранить</button><span id="skeystate" class="muted"></span></div>
   </div>
 </section>
@@ -767,11 +1011,11 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 
 <script>
 const $=s=>document.querySelector(s);
-const SECTIONS=["overview","vac","apply","stats","log","settings"];
-let tab="overview";
+const SECTIONS=["overview","vac","apply","stats","tracks","log","settings"];
+let tab="overview";let TRACKS=[];
 function show(t){tab=t;document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
   SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));
-  if(t==="overview")loadOverview();if(t==="vac")loadVac();if(t==="settings")loadSettings();if(t==="stats")loadStats();}
+  if(t==="overview")loadOverview();if(t==="vac")loadVac();if(t==="settings")loadSettings();if(t==="stats")loadStats();if(t==="tracks")loadTracks(false);}
 document.querySelectorAll(".tab").forEach(el=>el.onclick=()=>show(el.dataset.t));
 async function api(p,opt){const r=await fetch(p,opt);return r.json();}
 function esc(s){return (s||"").toString().replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
@@ -832,17 +1076,53 @@ async function job(action,track){const body={action,track:track||$("#atrack")?.v
   if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
 
 /* ---- settings ---- */
+function fillTrackSelects(tracks){TRACKS=tracks||[];
+  for(const id of ["#vtrack","#atrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
+    sel.innerHTML=TRACKS.map(t=>`<option value="${t.key}">${esc(t.label)}</option>`).join("");
+    if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
+  const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
 async function loadSettings(){const s=await api("/api/settings");
+  fillTrackSelects(s.tracks);
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
   $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";
   $("#sconstraints").value=s.constraints||"";$("#ssalary").value=s.salary_expectation||"";
-  $("#scritai").value=s.criteria_ai||"";$("#scritinfra").value=s.criteria_infra||"";}
+  const cr=s.criteria||{};
+  $("#scrit").innerHTML=(s.tracks||[]).map(t=>`<div class="row" style="margin-bottom:2px"><label style="width:170px">${esc(t.label)} <span class="muted">(${t.type})</span></label></div>`
+    +`<textarea data-crit="${t.key}" rows="3" style="width:100%">${esc(cr[t.key]||"")}</textarea>`).join("")
+    ||'<span class="muted">нет треков</span>';}
 async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value,
-  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value,
-  criteria_ai:$("#scritai").value,criteria_infra:$("#scritinfra").value};
+  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value};
+  document.querySelectorAll("#scrit textarea[data-crit]").forEach(t=>{body["criteria_"+t.dataset.crit]=t.value;});
   const k=$("#skey").value.trim();if(k)body.api_key=k;
   const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено";}
+
+/* ---- resumes & tracks ---- */
+async function loadTracks(refresh){$("#tracksmeta").innerHTML=refresh?'<span class="spin"></span> читаю резюме с HH…':$("#tracksmeta").innerHTML;
+  const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
+  fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label,type:t.type})));
+  let h='<table><tr><th>Трек</th><th>Рубрика</th><th>Резюме на HH</th><th>Статус</th><th>Файлы</th></tr>';
+  for(const t of (d.tracks||[])){let st;
+    if(t.resume_present===true)st='<span class="pill FIT">на HH ✓</span>';
+    else if(t.resume_present===false)st='<span class="pill SKIP">нет на HH</span>';
+    else st='<span class="muted">резюме не указано</span>';
+    h+=`<tr><td><b>${esc(t.label)}</b><div class="muted">${t.key}</div></td><td>${t.type}</td>
+      <td>${esc(t.resume||"—")}</td><td>${st}</td>
+      <td class="muted" style="font-size:12px">${esc(t.profile)}<br>${esc(t.search)}</td></tr>`;}
+  $("#trackstable").innerHTML=h+"</table>";
+  const err=d.error?`<div class="hl" style="margin-top:8px">${esc(d.error)}</div>`:"";
+  const un=(d.unassigned_resumes||[]);
+  $("#unassigned").innerHTML=err+(un.length?`<div style="margin-top:10px" class="muted">Резюме на HH без трека: `+un.map(esc).join(", ")+`. Заведи под них трек ниже.</div>`
+    :(d.auth_status==="confirmed"?'<div class="muted" style="margin-top:10px">Все активные резюме HH привязаны к трекам.</div>':""));
+  $("#tracksmeta").textContent="Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (~10с).";}
+async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").value,type:$("#ttype").value,
+  resume:$("#tresume").value,queries:$("#tqueries").value,criteria:$("#tcriteria").value};
+  $("#tmsg").innerHTML='<span class="spin"></span> создаю…';
+  const r=await api("/api/track",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.error){$("#tmsg").textContent="Ошибка: "+r.error;return;}
+  $("#tmsg").textContent="Готово: "+r.profile+" — "+(r.note||"");
+  $("#tkey").value=$("#tlabel").value=$("#tresume").value=$("#tqueries").value=$("#tcriteria").value="";
+  loadTracks(false);}
 
 /* ---- stats ---- */
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
@@ -912,6 +1192,7 @@ let prevRunning=false;
 setInterval(async()=>{const running=await refreshJob();
   if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
   prevRunning=running;},3000);
-loadOverview();
+async function init(){try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}loadOverview();}
+init();
 </script>
 </body></html>"""
