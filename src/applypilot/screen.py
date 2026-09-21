@@ -27,8 +27,8 @@ from typing import Any
 
 from .config import professional_context
 
-SCREEN_PROMPT_VERSION = "2"
-DEFAULT_MODEL = "deepseek-v4-flash-0731"
+SCREEN_PROMPT_VERSION = "3"
+DEFAULT_MODEL = "gpt-5-mini"
 DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
 DEFAULT_CONCURRENCY = 2  # aitunnel throttles hard; keep concurrency low
 VERDICTS = ("FIT", "MAYBE", "SKIP")
@@ -39,36 +39,41 @@ TRACK_NOTES = {
     "ai": (
         "Направление: прикладной LLM/AI.\n"
         "FIT: интеграция LLM в продукт, AI-агенты, оркестрация, RAG, чат-боты, copilot, "
-        "prompt-инжиниринг, автоматизация; Python/FastAPI как обвязка вокруг моделей. "
-        "Зелёный флаг: Cursor / Claude Code / Codex / AI-native / AI-first в тексте.\n"
+        "prompt-инжиниринг, автоматизация; Python/FastAPI как обвязка вокруг моделей. Роль "
+        "реально берёт джуна/мидла (Junior/Middle, «1–3 года» или «нет опыта», «поможем "
+        "вырасти»). Зелёный флаг: Cursor / Claude Code / Codex / AI-native / AI-first в тексте.\n"
         "SKIP: ядро роли — классический ML/Data Science (обучение/дообучение моделей, "
         "fine-tuning, transformers-глубина, distributed training, матстатистика), тяжёлая "
         "дата-инженерия (ClickHouse/Spark/Airflow/DWH/окна-когорты как основная работа), "
-        "алго/CS-хардкор и высоконагруженный инференс на GPU, Senior/Lead/тимлид или 4+ лет "
-        "hands-on, основной стек не Python (C#/.NET, Java, Go, Unity, фронтенд-ядро React/Vue), "
-        "embedded/firmware, не-инженерные роли (QA, продажи, поддержка, аналитика как ядро), "
-        "партнёрство за долю без зарплаты.\n"
+        "алго/CS-хардкор и высоконагруженный инференс на GPU, Senior/Lead/тимлид или 3+ лет "
+        "hands-on как жёсткое требование, основной стек не Python (C#/.NET, Java, Go, Unity, "
+        "фронтенд-ядро React/Vue), embedded/firmware, не-инженерные роли (QA, продажи, поддержка, "
+        "аналитика как ядро), наставник/ментор/куратор/преподаватель курса, партнёрство за долю "
+        "без зарплаты.\n"
         "MAYBE: прикладной LLM есть, но заметны требования из SKIP (Middle+/Senior, 3+ года "
         "чистого кода, точечный 1С/ETL, элементы fine-tuning, fullstack с фронтенд-ядром)."
     ),
     "infra": (
         "Направление: DevOps / инфраструктура.\n"
         "FIT: практическая инфраструктура и эксплуатация — контейнеризация, Kubernetes, CI/CD, "
-        "мониторинг, администрирование Linux, деплой сервисов, self-hosted, облака. Интервью "
-        "скорее практическое, а не алгоритмическое.\n"
-        "SKIP: Senior/Lead/Principal или 5+ лет глубокого hands-on и руководство; ядро роли — "
-        "разработка на Go/C/Java как программиста с алго-интервью; узкий хардкор не из стека "
-        "кандидата как ядро (глубокая сетевая инженерия Cisco/BGP/NSX, DBA-тюнинг, "
-        "VMware vSphere/oVirt/Ceph-архитектура, embedded); техподдержка 1-й линии, эникей, 1С, "
-        "стажёрские/учебные программы, преподавание; офис без удалёнки.\n"
+        "мониторинг, администрирование Linux, деплой сервисов, self-hosted, облака, уровень "
+        "Junior/Middle («1–3 года» или «нет опыта»). Интервью скорее практическое, а не "
+        "алгоритмическое.\n"
+        "SKIP: Senior/Lead/Principal или 3+ лет глубокого hands-on как жёсткое требование и "
+        "руководство; ядро роли — разработка на Go/C/Java как программиста с алго-интервью; узкий "
+        "хардкор не из стека кандидата как ядро (глубокая сетевая инженерия Cisco/BGP/NSX, "
+        "DBA-тюнинг, VMware vSphere/oVirt/Ceph-архитектура, embedded); техподдержка 1-й линии, "
+        "эникей, 1С; наставник/ментор/куратор/преподаватель курса, стажёрские/учебные программы; "
+        "офис без удалёнки.\n"
         "MAYBE: практическая роль, но критичное ядро — глубокий Ansible+Terraform/service mesh, "
         "которых у кандидата пока нет, либо описание слишком общее."
     ),
     "general": (
-        "FIT: роль в зоне кандидата (прикладной LLM/AI или практический DevOps) с интервью по "
-        "портфолио/практике.\n"
+        "FIT: роль в зоне кандидата (прикладной LLM/AI или практический DevOps) уровня "
+        "Junior/Middle с интервью по портфолио/практике.\n"
         "SKIP: требуется сильный самостоятельный hands-on кодинг с алго-интервью, классический "
-        "ML/дата-инженерия, Senior/Lead/руководство, чужой основной стек или не-инженерная роль.\n"
+        "ML/дата-инженерия, Senior/Lead/руководство или 3+ года как жёсткое требование, чужой "
+        "основной стек, наставник/преподаватель или иная не-инженерная роль.\n"
         "MAYBE: смесь или мало данных."
     ),
 }
@@ -102,10 +107,16 @@ def candidate_context(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rubric(profile: dict[str, Any], track: str) -> str:
-    override = (profile.get("screen", {}) or {}).get("criteria")
+    """Built-in track rubric, augmented (not replaced) by any user override.
+
+    A private ``[screen].criteria`` string is appended as extra, higher-priority
+    rules so the operator can fine-tune without losing the vetted base rubric.
+    """
+    base = TRACK_NOTES.get(track, TRACK_NOTES["general"])
+    override = str((profile.get("screen", {}) or {}).get("criteria") or "").strip()
     if override:
-        return str(override)
-    return TRACK_NOTES.get(track, TRACK_NOTES["general"])
+        return f"{base}\n\nДОПОЛНИТЕЛЬНЫЕ ПРАВИЛА ОТ ПОЛЬЗОВАТЕЛЯ (приоритетнее базовых):\n{override}"
+    return base
 
 
 def screen_messages(item: dict[str, Any], candidate: dict[str, Any], rubric: str) -> list[dict[str, str]]:
@@ -116,13 +127,23 @@ def screen_messages(item: dict[str, Any], candidate: dict[str, Any], rubric: str
         "фактами о кандидате.\n\n"
         f"КАНДИДАТ:\n{json.dumps(candidate, ensure_ascii=False)}\n\n"
         f"КРИТЕРИИ:\n{rubric}\n\n"
+        "ОПЫТ (учитывай обязательно и строго): у кандидата реальный hands-on опыт ~1.3 года. "
+        "Требования вакансии сопоставляй с этим фактом, а не выдавай желаемое за действительное.\n"
+        "- Если вакансия требует 3+ года (поле ОПЫТ = «3–6 лет» или «более 6 лет», либо в тексте "
+        "«от 3 лет», «Senior», «Lead», «ведущий», «главный») в ключевом навыке — это НЕ FIT: "
+        "максимум MAYBE, а если сеньорность или годы опыта — центральное требование, то SKIP.\n"
+        "- FIT допустим ТОЛЬКО когда роль реально берёт джуна/мидла (поле ОПЫТ = «нет опыта» или "
+        "«1–3 года», формулировки Junior/Middle/начинающий/«поможем вырасти»).\n"
+        "- Наставник/ментор/куратор/преподаватель курса, стажировки как обучение, техподдержка "
+        "1-й линии/эникей — это не инженерная роль под кандидата → SKIP.\n\n"
         "ЗАРПЛАТА (учитывай обязательно): сопоставляй ориентир кандидата с зарплатой вакансии — "
         "и из поля ЗАРПЛАТА, и из текста описания. Если явно указана вилка заметно ниже ориентира: "
         "сильно ниже (например 40–60к) → SKIP; умеренно ниже или обещание выйти на ориентир только "
         "через год → не выше MAYBE. Зарплата не указана вовсе — это НЕ штраф.\n\n"
         "Верни СТРОГО один JSON-объект без markdown и без пояснений вокруг: "
         '{"verdict":"FIT|MAYBE|SKIP","fit_score":<целое 0-100>,"reason":"<одна короткая фраза '
-        'по-русски, почему>"}. fit_score — насколько роль подходит кандидату (100 — идеально).'
+        'по-русски, почему>"}. fit_score — честная оценка шансов кандидата (100 — идеально); '
+        "FIT ставь только при fit_score ≥ 70 и реальном соответствии по опыту."
     )
     salary = item.get("salary")
     user = (
@@ -269,9 +290,14 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
     ledger_lock = threading.Lock()
 
     def run(item: dict[str, Any]) -> dict[str, Any]:
+        # Carry the human-facing vacancy facts into the row so the admin can show
+        # required experience / salary next to the verdict (and dedup reposts).
         base = {"id": str(item.get("id", "")), "name": item.get("name", ""),
                 "company": item.get("company", ""), "url": item.get("url", ""),
-                "score": int(item.get("score", 0) or 0)}
+                "score": int(item.get("score", 0) or 0),
+                "experience": item.get("experience", ""), "salary": item.get("salary"),
+                "area": item.get("area", ""), "schedule": item.get("schedule", ""),
+                "published": item.get("published", "")}
         path = cache_dir / f"screen-{screen_cache_key(item, candidate, model, track)}.json"
         if path.exists():
             try:

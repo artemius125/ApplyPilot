@@ -1,0 +1,30 @@
+# applypilot-watch.service — systemd USER-юнит (не системный!).
+#
+# Один разовый прогон watcher: скан свежих вакансий HH + LLM-скрининг обоих
+# направлений. Отклик остаётся ручным — этот юнит НИЧЕГО НЕ ОТКЛИКАЕТСЯ.
+#
+# Установка (от обычного пользователя, без sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/applypilot-watch.service packaging/applypilot-watch.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now applypilot-watch.timer
+#
+# Ручной прогон прямо сейчас:      systemctl --user start applypilot-watch.service
+# Логи юнита:                      journalctl --user -u applypilot-watch.service
+# Лог самого watcher:              ~/Загрузки/ApplyPilot/private/data/watch.log
+#
+# Правьте APPLYPILOT_HOME ниже под свой путь к репозиторию.
+# Ключ aitunnel можно задать здесь через Environment=AITUNNEL_API_KEY=sk-aitunnel-...
+# либо оставить пустым — тогда он читается из private/data/admin-settings.json.
+
+[Unit]
+Description=ApplyPilot: скан свежих вакансий HH + скрининг (без отклика)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=APPLYPILOT_HOME=%h/Загрузки/ApplyPilot
+# Environment=AITUNNEL_API_KEY=sk-aitunnel-...
+ExecStart=%h/Загрузки/ApplyPilot/packaging/applypilot-watch.sh
+Nice=10

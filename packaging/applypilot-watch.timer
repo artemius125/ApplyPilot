@@ -1,0 +1,28 @@
+# applypilot-watch.timer — systemd USER-таймер для applypilot-watch.service.
+#
+# Запускает watcher вскоре после входа/загрузки и далее раз в час.
+#
+# Установка (от обычного пользователя, без sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/applypilot-watch.service packaging/applypilot-watch.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now applypilot-watch.timer
+#
+# Проверить расписание:            systemctl --user list-timers applypilot-watch.timer
+# Остановить/выключить:            systemctl --user disable --now applypilot-watch.timer
+#
+# Изменить интервал: поправьте OnUnitActiveSec ниже (например, =30min или =2h),
+# затем `systemctl --user daemon-reload && systemctl --user restart applypilot-watch.timer`.
+# Чтобы watcher не «догонял» пропущенные запуски при выключенном ПК — уберите Persistent=true.
+
+[Unit]
+Description=ApplyPilot watch: периодический скан+скрининг свежих вакансий HH
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=applypilot-watch.service
+
+[Install]
+WantedBy=timers.target
