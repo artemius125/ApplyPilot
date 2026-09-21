@@ -1039,6 +1039,7 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
 
 
 
+
 INDEX_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApplyPilot admin</title>
@@ -1076,7 +1077,7 @@ textarea{resize:vertical;width:100%;line-height:1.5}
 .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin-top:12px}
 table{width:100%;border-collapse:collapse;min-width:900px}
 th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mut);font-weight:600;font-size:12px;position:sticky;top:var(--hdr);background:#151a21;z-index:1}
+th{color:var(--mut);font-weight:600;font-size:12px;background:#151a21}
 tr:hover td{background:#151b22}
 td.nowrap,th.nowrap{white-space:nowrap}
 td.reason{color:var(--mut);max-width:44ch}
