@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppConfig, ConfigError, effective_search
+from .letters import LettersError, generate_letter
 from .storage import Store
 
 # track -> the profile/search/snapshot artifacts that our two-track setup uses.
@@ -164,6 +165,10 @@ class AdminApp:
             "base_url": s.get("base_url") or DEFAULT_BASE_URL,
             "key_set": bool(s.get("api_key") or os.getenv("AITUNNEL_API_KEY")),
             "models": MODEL_CHOICES,
+            "constraints": s.get("constraints") or "",
+            "salary_expectation": s.get("salary_expectation") or "",
+            "criteria_ai": s.get("criteria_ai") or "",
+            "criteria_infra": s.get("criteria_infra") or "",
         }
 
     def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +177,10 @@ class AdminApp:
             s["model"] = str(patch["model"]).strip()
         if patch.get("base_url"):
             s["base_url"] = str(patch["base_url"]).strip()
+        # Free-text prompt/candidate overrides ("" clears them).
+        for fld in ("constraints", "salary_expectation", "criteria_ai", "criteria_infra"):
+            if fld in patch and isinstance(patch[fld], str):
+                s[fld] = patch[fld].strip()
         # Only overwrite the key when a non-empty value is supplied; "" leaves it as is.
         api_key = patch.get("api_key")
         if isinstance(api_key, str) and api_key.strip():
@@ -286,9 +295,15 @@ class AdminApp:
                 "--track", track,
                 "--output", cfg["screen_report"], "--emit-snapshot", cfg["accepted"],
             ]
-            model = str(self.load_settings().get("model") or "").strip()
-            if model:
-                argv += ["--model", model]
+            s = self.load_settings()
+            if str(s.get("model") or "").strip():
+                argv += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                argv += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                argv += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                argv += ["--criteria", str(s[f"criteria_{track}"])]
             if not self._screen_env() and not os.getenv("AITUNNEL_API_KEY"):
                 return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
         elif action == "analytics":
@@ -313,6 +328,34 @@ class AdminApp:
         else:
             return False, f"unknown action: {action}"
         return self.runner.start(argv, f"{action}:{track}", env=self._screen_env())
+
+    def letter(self, track: str, vid: str) -> dict[str, Any]:
+        """Generate an individual cover letter for one vacancy (in-process)."""
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        item = None
+        for source in (Path(_track_snapshot(self.root, track)), self.root / TRACKS[track]["accepted"]):
+            data = _read_json(source) or {}
+            items = data.get("items", []) if isinstance(data, dict) else []
+            item = next((it for it in items if str(it.get("id", "")) == str(vid)), None)
+            if item is not None:
+                break
+        if item is None:
+            return {"error": "vacancy not found"}
+        s = self.load_settings()
+        key = str(s.get("api_key") or "").strip() or os.getenv("AITUNNEL_API_KEY", "")
+        if not key:
+            return {"error": "no AITUNNEL_API_KEY: задайте ключ в «Настройки»"}
+        try:
+            res = generate_letter(
+                item, _profile_flag(self.root, track), self.config.data_dir / "letter-cache",
+                model=str(s.get("model") or DEFAULT_MODEL).strip(),
+                base_url=str(s.get("base_url") or DEFAULT_BASE_URL).strip(), api_key=key,
+            )
+        except LettersError as exc:
+            return {"error": str(exc)[:200]}
+        return {"text": res.get("text", ""), "source": res.get("source", ""),
+                "url": item.get("url", ""), "name": item.get("name", "")}
 
 
 def _track_queries(root: Path, track: str) -> set[str]:
@@ -380,6 +423,9 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, {"ok": app.runner.stop()})
             elif parsed.path == "/api/settings":
                 self._send(200, app.save_settings(body if isinstance(body, dict) else {}))
+            elif parsed.path == "/api/letter":
+                b = body if isinstance(body, dict) else {}
+                self._send(200, app.letter(str(b.get("track", "ai")), str(b.get("id", ""))))
             else:
                 self._send(404, {"error": "not found"})
 
@@ -461,6 +507,12 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <button class="ghost" onclick="loadVac()">Обновить</button>
     <span id="vmeta" class="muted"></span></div>
   <div id="vtable"></div>
+  <div class="card" id="letterbox" style="display:none;margin-top:12px">
+    <h3>Сопроводительное письмо — <span id="lettertitle"></span></h3>
+    <textarea id="lettertext" rows="8" style="width:100%"></textarea>
+    <div class="row"><button onclick="copyLetter()">Копировать</button><button class="ghost" onclick="openHH()">Открыть на HH</button><span id="letterhint" class="muted"></span></div>
+    <p class="muted">Проверь письмо перед отправкой. Отклик и отправку письма делаешь на HH сам (ассистированный режим).</p>
+  </div>
 </section>
 <section id="apply" class="hide">
   <div class="card" style="max-width:640px">
@@ -488,8 +540,16 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <div class="row"><label>Модель</label><select id="smodel" style="min-width:220px"></select></div>
     <div class="row"><label>Base URL</label><input id="sbase" style="min-width:340px"></div>
     <div class="row"><label>API-ключ</label><input id="skey" type="password" placeholder="sk-aitunnel-... (оставь пустым — не менять)" style="min-width:340px"></div>
-    <div class="row"><button onclick="saveSettings()">Сохранить</button><span id="skeystate" class="muted"></span></div>
     <p class="muted">Ключ хранится локально (права 600), в интерфейс не возвращается. У каждого пользователя — свой ключ.</p>
+    <h3 style="margin-top:14px">Кого ищем и промпт скрининга</h3>
+    <div class="row"><label style="width:150px">Ограничения кандидата</label></div>
+    <textarea id="sconstraints" rows="3" style="width:100%" placeholder="напр.: пишет код только с ИИ, не пройдёт live-coding, опыт ~1.3 года, только удалёнка"></textarea>
+    <div class="row"><label style="width:150px">Зарплатный ориентир</label><input id="ssalary" style="min-width:340px" placeholder="напр.: ориентир от 100 000 ₽; вилки заметно ниже неинтересны"></div>
+    <div class="row"><label style="width:150px">Промпт скрининга — AI</label></div>
+    <textarea id="scritai" rows="4" style="width:100%" placeholder="оставь пустым — использовать встроенную рубрику AI"></textarea>
+    <div class="row"><label style="width:150px">Промпт скрининга — DevOps</label></div>
+    <textarea id="scritinfra" rows="4" style="width:100%" placeholder="оставь пустым — использовать встроенную рубрику DevOps"></textarea>
+    <div class="row"><button onclick="saveSettings()">Сохранить</button><span id="skeystate" class="muted"></span></div>
   </div>
 </section>
 </main>
@@ -524,8 +584,13 @@ async function job(action,track){const body={action,track:track||$("#atrack")?.v
   ["overview","vac","apply","stats","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!=="log"));refreshJob();}
 async function loadSettings(){const s=await api("/api/settings");
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
-  $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";}
-async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value};const k=$("#skey").value.trim();if(k)body.api_key=k;
+  $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";
+  $("#sconstraints").value=s.constraints||"";$("#ssalary").value=s.salary_expectation||"";
+  $("#scritai").value=s.criteria_ai||"";$("#scritinfra").value=s.criteria_infra||"";}
+async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value,
+  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value,
+  criteria_ai:$("#scritai").value,criteria_infra:$("#scritinfra").value};
+  const k=$("#skey").value.trim();if(k)body.api_key=k;
   const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено";}
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
@@ -547,13 +612,24 @@ async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
 async function loadVac(){const tr=$("#vtrack").value,f=$("#vfilter").value,showskip=$("#vshowskip").checked;const d=await api("/api/vacancies?track="+tr);
   let rows=(d.rows||[]).filter(r=> f ? r.verdict===f : (showskip || r.verdict!=="SKIP"));
   $("#vmeta").textContent=`модель ${d.model||"—"} · показано ${rows.length} из ${d.count||0}`;
-  let h='<table><tr><th>Вердикт</th><th>fit</th><th>score</th><th>Вакансия</th><th>Причина</th><th>Статус</th></tr>';
+  let h='<table><tr><th>Вердикт</th><th>fit</th><th>score</th><th>Вакансия</th><th>Причина</th><th>Статус</th><th>Действие</th></tr>';
   for(const r of rows){h+=`<tr><td><span class="pill ${r.verdict}">${r.verdict||"?"}</span></td>
     <td>${r.fit_score??""}</td><td>${r.score??""}</td>
     <td><a href="${r.url}" target="_blank">${esc(r.name)}</a><div class="muted">${esc(r.company||"")}</div></td>
     <td class="muted">${esc(r.reason||"")}</td>
-    <td>${r.blocked?'<span class="muted">откликался</span>':(r.db_status||"")}</td></tr>`;}
+    <td>${r.blocked?'<span class="muted">откликался</span>':(r.db_status||"")}</td>
+    <td><button class="ghost" onclick="genLetter('${tr}','${r.id}','${encodeURIComponent(r.url||"")}')">Письмо+HH</button></td></tr>`;}
   $("#vtable").innerHTML=h+"</table>";}
+async function genLetter(track,id,url){const box=$("#letterbox");box.style.display="block";
+  box.querySelector("#lettertext").value="Генерирую письмо…";
+  const r=await api("/api/letter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({track,id})});
+  if(r.error){box.querySelector("#lettertext").value="Ошибка: "+r.error;return;}
+  box.querySelector("#lettertitle").textContent=r.name||"";box.querySelector("#lettertext").value=r.text||"";
+  box.dataset.url=decodeURIComponent(url||"")||r.url||"";
+  try{await navigator.clipboard.writeText(r.text||"");box.querySelector("#letterhint").textContent="письмо скопировано в буфер";}
+  catch(e){box.querySelector("#letterhint").textContent="скопируй письмо вручную (буфер недоступен)";}}
+function copyLetter(){const t=$("#lettertext").value;navigator.clipboard&&navigator.clipboard.writeText(t);}
+function openHH(){const u=$("#letterbox").dataset.url;if(u)window.open(u,"_blank");}
 function esc(s){return (s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 let prevRunning=false;
 setInterval(async()=>{const running=await refreshJob();

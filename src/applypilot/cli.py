@@ -25,6 +25,7 @@ from .config import (
 )
 from .cover_letters import letter_mode, load_letter_profile, render_template
 from .llm import generate
+from .pacing import next_delay
 from .parser import ScanSegment, enrich_items, load_items, save_snapshot, scan_many
 from .presets import ROLE_PRESETS
 from .quality import run_benchmark
@@ -163,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="which verdicts are written to the emitted snapshot")
     screen.add_argument("--model", default=None)
     screen.add_argument("--concurrency", type=int, default=None)
+    screen.add_argument("--criteria", default=None, help="override the screening rubric (prompt)")
+    screen.add_argument("--constraints", default=None, help="override candidate constraints")
+    screen.add_argument("--salary-expectation", default=None, help="override salary expectation line")
     screen.add_argument("--output", type=Path, help="private JSON verdict report")
     screen.add_argument("--emit-snapshot", type=Path,
                         help="write a snapshot of accepted vacancies for `apply`")
@@ -614,6 +618,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"invalid search configuration: {exc}", file=sys.stderr)
             return 2
         profile = _profile(config, search)
+        # Admin-supplied prompt overrides (candidate/criteria/salary) patch the screen config.
+        screen_over = dict(profile.get("screen", {}) or {})
+        if args.criteria:
+            screen_over["criteria"] = args.criteria
+        if args.constraints:
+            screen_over["constraints"] = args.constraints
+        if args.salary_expectation:
+            screen_over["salary_expectation"] = args.salary_expectation
+        profile = {**profile, "screen": screen_over}
         account = _account(profile)
         min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
         candidates = filter_candidates(
@@ -746,6 +759,11 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     timing = profile.get("apply", {}) or {}
     delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
     delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
+    # Humanised pacing: occasional longer pauses to avoid tripping bot heuristics.
+    long_pause_every = int(timing.get("long_pause_every", 0))
+    long_pause_min = max(0.0, float(timing.get("long_pause_min_seconds", 0)))
+    long_pause_max = max(long_pause_min, float(timing.get("long_pause_max_seconds", long_pause_min)))
+    pacing_rng = random.Random()
     confirmation_timeout = max(0.0, float(timing.get("confirmation_timeout_seconds", 15)))
     run_status = "completed"
     stop_reason = ""
@@ -823,7 +841,11 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     stop_reason = f"confirmed success target reached ({confirmed_successes})"
                     break
                 if index < len(selected) and delay_max:
-                    time.sleep(random.uniform(delay_min, delay_max))
+                    time.sleep(next_delay(
+                        pacing_rng, min_seconds=delay_min, max_seconds=delay_max, index=index,
+                        long_pause_every=long_pause_every,
+                        long_pause_min=long_pause_min, long_pause_max=long_pause_max,
+                    ))
         except KeyboardInterrupt:
             run_status = "interrupted"
             stop_reason = "run interrupted"
