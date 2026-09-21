@@ -203,11 +203,36 @@ class Store:
     def statuses(self, account: str = "default") -> dict[str, str]:
         return self.read_statuses(account) if self.path.exists() else {}
 
+    def negotiation_ids(self, account: str = "default") -> set[str]:
+        """Read vacancy IDs present in HH negotiations (synced applications), read-only.
+
+        Any vacancy in the negotiation ledger is one the account already applied to,
+        regardless of the HH-side status, so it must never be re-applied to.
+        """
+        if not self.path.exists():
+            return set()
+        uri = f"file:{self.path.resolve()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            return set()
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["vacancy_id"] for row in conn.execute(
+                "SELECT vacancy_id FROM negotiation_statuses WHERE account=?", (account,))}
+        except sqlite3.Error:
+            return set()
+        finally:
+            conn.close()
+
     def blocked_ids(self, account: str = "default") -> set[str]:
-        return {
+        blocked = {
             vacancy_id for vacancy_id, status in self.read_statuses(account).items()
             if status in BLOCKED_STATUSES
         }
+        # Anything already in HH negotiations (applied to manually or by a prior run) is blocked.
+        blocked |= self.negotiation_ids(account)
+        return blocked
 
     def start_run(self, run_id: str, account: str, mode: str, input_path: Path,
                   requested_limit: int, items: list[dict[str, Any]]) -> None:

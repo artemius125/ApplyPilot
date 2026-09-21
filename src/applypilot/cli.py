@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import __version__
+from .admin import serve as admin_serve
 from .analytics import report
 from .config import (
     AppConfig,
@@ -33,6 +34,13 @@ from .scoring import (
     evaluate_search_filter,
     filter_candidates,
     prioritize_for_enrichment,
+)
+from .screen import (
+    DEFAULT_BASE_URL,
+    DEFAULT_CONCURRENCY,
+    DEFAULT_MODEL,
+    ScreenError,
+    screen_vacancies,
 )
 from .session import check_session, login, save_state, validate_state
 from .storage import Store
@@ -144,6 +152,20 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--top", type=int, default=20)
     review.add_argument("--output", type=Path)
     review.add_argument("--preset", choices=PRESET_CHOICES)
+
+    screen = sub.add_parser("screen", help="LLM fit-screening of filtered vacancies (opt-in)")
+    screen.add_argument("--input", required=True, type=Path)
+    screen.add_argument("--preset", choices=PRESET_CHOICES)
+    screen.add_argument("--limit", type=int, default=200)
+    screen.add_argument("--min-score", type=int, default=None)
+    screen.add_argument("--track", choices=["ai", "infra", "general"], default="general")
+    screen.add_argument("--accept", choices=["fit", "fit+maybe"], default="fit+maybe",
+                        help="which verdicts are written to the emitted snapshot")
+    screen.add_argument("--model", default=None)
+    screen.add_argument("--concurrency", type=int, default=None)
+    screen.add_argument("--output", type=Path, help="private JSON verdict report")
+    screen.add_argument("--emit-snapshot", type=Path,
+                        help="write a snapshot of accepted vacancies for `apply`")
     config_cmd = sub.add_parser("config", help="inspect effective configuration")
     config_sub = config_cmd.add_subparsers(dest="config_action", required=True)
     config_show = config_sub.add_parser("show", help="show effective search settings")
@@ -154,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     template_init = templates_sub.add_parser("init", help="create a new template without overwriting")
     template_init.add_argument("--name", required=True, choices=list_templates())
     template_init.add_argument("--output", required=True, type=Path)
+
+    admin = sub.add_parser("admin", help="serve the local admin web UI")
+    admin.add_argument("--host", default="127.0.0.1")
+    admin.add_argument("--port", type=int, default=8765)
+    admin.add_argument("--open", action="store_true", help="open the admin page in a browser")
     return parser
 
 
@@ -240,6 +267,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"network: HTTP {response.status_code}")
             except requests.RequestException as exc:
                 print(f"network: error ({exc})")
+        return 0
+
+    if args.command == "admin":
+        admin_serve(config, host=args.host, port=args.port, open_browser=args.open)
         return 0
 
     session_path = config.data_dir / "hh_session.json"
@@ -574,6 +605,73 @@ def main(argv: list[str] | None = None) -> int:
         search = effective_search(config.load_search(), args.preset)
         output = args.output or config.data_dir / "reports" / "review.html"
         print(f"review: {write_review(load_items(args.input), _profile(config, search), output, args.top)}")
+        return 0
+    if args.command == "screen":
+        raw_items = load_items(args.input)
+        try:
+            search = effective_search(config.load_search(), args.preset)
+        except ConfigError as exc:
+            print(f"invalid search configuration: {exc}", file=sys.stderr)
+            return 2
+        profile = _profile(config, search)
+        account = _account(profile)
+        min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
+        candidates = filter_candidates(
+            raw_items, profile, args.limit, min_score,
+            blocked_ids=Store(config.db_path).blocked_ids(account),
+        )
+        by_id = {str(item.get("id", "")): item for item in raw_items}
+        to_screen: list[dict] = []
+        for candidate in candidates:
+            item = dict(by_id.get(candidate.id, {}))
+            item["score"] = candidate.score
+            to_screen.append(item)
+        screen_cfg = profile.get("screen", {}) or {}
+        model = args.model or screen_cfg.get("model") or DEFAULT_MODEL
+        base_url = screen_cfg.get("base_url") or DEFAULT_BASE_URL
+        concurrency = args.concurrency or int(screen_cfg.get("concurrency", DEFAULT_CONCURRENCY))
+        report_path = args.output or _default_artifact(config, "reports", "json")
+
+        def _counts(rows: list[dict]) -> dict[str, int]:
+            return {verdict: sum(1 for row in rows if row.get("verdict") == verdict)
+                    for verdict in ("FIT", "MAYBE", "SKIP")}
+
+        streamed: list[dict] = []
+
+        def _on_result(row: dict, done: int, total: int) -> None:
+            streamed.append(row)
+            # Live progress line (streamed to the admin log) + incremental report.
+            print(f"[{done}/{total}] {row.get('verdict', '?'):5} "
+                  f"fit={row.get('fit_score', 0):>3} {row.get('name', '')[:70]}", flush=True)
+            _write_private_json(report_path, {"model": model, "track": args.track,
+                                              "counts": _counts(streamed), "results": streamed,
+                                              "progress": {"done": done, "total": total}})
+
+        try:
+            results = screen_vacancies(
+                to_screen, profile, config.data_dir / "screen-cache",
+                model=model, base_url=base_url, track=args.track, concurrency=concurrency,
+                on_result=_on_result,
+            )
+        except ScreenError as exc:
+            print(f"screen: error ({exc})", file=sys.stderr)
+            return 3
+        counts = _counts(results)
+        _write_private_json(report_path, {"model": model, "track": args.track,
+                                          "counts": counts, "results": results})
+        accepted = {"FIT"} if args.accept == "fit" else {"FIT", "MAYBE"}
+        accepted_ids = [row["id"] for row in results if row.get("verdict") in accepted]
+        for verdict in ("FIT", "MAYBE", "SKIP"):
+            print(f"{verdict}: {counts[verdict]}")
+        print(f"screened: {len(results)}; model={model}; track={args.track}")
+        print(f"screen_report: {report_path}")
+        if args.emit_snapshot:
+            accepted_items = [by_id[i] for i in accepted_ids if i in by_id]
+            _write_private_json(args.emit_snapshot, {
+                "schema_version": 3, "source": "hh.ru", "status": "ok",
+                "query": f"screen:{args.track}", "items": accepted_items,
+            })
+            print(f"accepted ({args.accept}): {len(accepted_items)} -> {args.emit_snapshot}")
         return 0
     if args.command == "config" and args.config_action == "show":
         raw = config.load_search()
