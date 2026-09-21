@@ -515,6 +515,8 @@ class AdminApp:
         statuses = store.read_statuses("hh-primary") if self.config.db_path.exists() else {}
         blocked = store.blocked_ids("hh-primary") if self.config.db_path.exists() else set()
         applied = self._manual_applied()
+        viewed = self._viewed()
+        bad = self._bad()
         rows = []
         for row in results:
             vid = str(row.get("id", ""))
@@ -525,6 +527,8 @@ class AdminApp:
                 "db_status": statuses.get(vid, ""),
                 "blocked": vid in blocked,
                 "applied": vid in applied,
+                "viewed": vid in viewed,
+                "bad": vid in bad,
                 "exp_label": _exp_label(row.get("experience", "")),
                 "over_experience": str(row.get("experience", "")) in OVER_EXPERIENCE,
                 "salary_label": _salary_label(row.get("salary")),
@@ -782,6 +786,38 @@ class AdminApp:
         path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
         return {"ok": True, "applied": len(s), "on": on}
 
+    # ---- viewed set (opened on HH → hidden from the pool) --------------
+    def _viewed_path(self) -> Path:
+        return self.config.data_dir / "viewed.json"
+
+    def _viewed(self) -> set[str]:
+        data = _read_json(self._viewed_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_viewed(self, vid: str, on: bool = True) -> dict[str, Any]:
+        s = self._viewed()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._viewed_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "viewed": len(s), "on": on}
+
+    # ---- bad set (user marked "не то" → out of the pool and the queue) --
+    def _bad_path(self) -> Path:
+        return self.config.data_dir / "bad.json"
+
+    def _bad(self) -> set[str]:
+        data = _read_json(self._bad_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_bad(self, vid: str, on: bool = True) -> dict[str, Any]:
+        s = self._bad()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._bad_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "bad": len(s), "on": on}
+
     # ---- apply queue (what a run will actually send to) ----------------
     def apply_queue(self, track: str, mode: str = "all", limit: int = 10,
                     marked: list[str] | None = None) -> dict[str, Any]:
@@ -789,7 +825,8 @@ class AdminApp:
             return {"error": "unknown track"}
         rows = self.vacancies(track).get("rows", [])
         marks = {str(m) for m in (marked or [])}
-        accepted = [r for r in rows if r.get("verdict") in ("FIT", "MAYBE")]
+        # A vacancy the user marked "bad" is out of the pool entirely.
+        accepted = [r for r in rows if r.get("verdict") in ("FIT", "MAYBE") and not r.get("bad")]
         if mode == "fit":
             accepted = [r for r in accepted if r.get("verdict") == "FIT"]
         elif mode == "marked":
@@ -814,10 +851,11 @@ class AdminApp:
         verdict_by = {str(r.get("id")): r.get("verdict") for r in report.get("results", [])}
         marks = {str(m) for m in (marked or [])}
         applied = self._manual_applied()
+        bad = self._bad()
         keep = []
         for it in items:
             vid = str(it.get("id"))
-            if vid in applied:
+            if vid in applied or vid in bad:
                 continue
             if mode == "fit" and verdict_by.get(vid) != "FIT":
                 continue
@@ -997,6 +1035,12 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/api/applied":
                 b = body if isinstance(body, dict) else {}
                 self._send(200, app.mark_applied(str(b.get("id", "")), bool(b.get("on", True))))
+            elif parsed.path == "/api/viewed":
+                b = body if isinstance(body, dict) else {}
+                self._send(200, app.mark_viewed(str(b.get("id", "")), bool(b.get("on", True))))
+            elif parsed.path == "/api/bad":
+                b = body if isinstance(body, dict) else {}
+                self._send(200, app.mark_bad(str(b.get("id", "")), bool(b.get("on", True))))
             elif parsed.path == "/api/watch":
                 b = body if isinstance(body, dict) else {}
                 res = app.watch_control(str(b.get("action", "")), b.get("minutes"))
@@ -1033,6 +1077,8 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
         print("\nstopping admin")
     finally:
         server.server_close()
+
+
 
 
 
@@ -1131,11 +1177,12 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 
 <section id="vac" class="hide">
   <div class="row"><label>Трек</label><select id="vtrack"></select>
-    <span class="seg" id="vseg"></span>
-    <label><input type="checkbox" id="vfresh"> свежие</label>
-    <label><input type="checkbox" id="vmarked"> отмеченные ★</label>
+    <span class="seg" id="vstatusseg"></span>
     <button class="ghost mini" onclick="loadVac()">Обновить</button>
     <span id="vmeta" class="muted"></span></div>
+  <div class="row"><span class="seg" id="vseg"></span>
+    <label><input type="checkbox" id="vfresh"> свежие</label>
+    <label><input type="checkbox" id="vmarked"> отмеченные ★</label></div>
   <div class="legend">
     <span><span class="dot" style="background:var(--fit)"></span>FIT — подходит</span>
     <span><span class="dot" style="background:var(--maybe)"></span>MAYBE — на грани</span>
@@ -1293,14 +1340,21 @@ async function job(action,track){const body={action,track:track||"ai"};
   if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
 
 /* ---- vacancies ---- */
+let VSTATUS="active";
+function bucket(r){return r.bad?"bad":(r.viewed?"viewed":"active");}
 async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
   const onlyFresh=$("#vfresh").checked,onlyMarked=$("#vmarked").checked,mk=marks();
   const d=await api("/api/vacancies?track="+tr);
   const all=d.rows||[];
-  const cnt={FIT:0,MAYBE:0,SKIP:0};all.forEach(r=>cnt[r.verdict]=(cnt[r.verdict]||0)+1);
-  $("#vseg").innerHTML=[["","все",all.length],["FIT","FIT",cnt.FIT||0],["MAYBE","MAYBE",cnt.MAYBE||0],["SKIP","SKIP",cnt.SKIP||0]]
+  const bc={active:0,viewed:0,bad:0};all.forEach(r=>bc[bucket(r)]++);
+  $("#vstatusseg").innerHTML=[["active","Активные",bc.active],["viewed","Просмотренные",bc.viewed],["bad","Плохие",bc.bad]]
+    .map(([v,l,n])=>`<button class="${VSTATUS===v?"on":""}" onclick="VSTATUS='${v}';loadVac()">${l} ${n}</button>`).join("");
+  let scoped=all.filter(r=>bucket(r)===VSTATUS);
+  const cnt={FIT:0,MAYBE:0,SKIP:0};scoped.forEach(r=>cnt[r.verdict]=(cnt[r.verdict]||0)+1);
+  const allN=VSTATUS==="active"?((cnt.FIT||0)+(cnt.MAYBE||0)):scoped.length;
+  $("#vseg").innerHTML=[["","все",allN],["FIT","FIT",cnt.FIT||0],["MAYBE","MAYBE",cnt.MAYBE||0],["SKIP","SKIP",cnt.SKIP||0]]
     .map(([v,l,n])=>`<button class="${VFILTER===v?"on":""}" onclick="VFILTER='${v}';loadVac()">${l} ${n}</button>`).join("");
-  let rows=all.filter(r=> VFILTER? r.verdict===VFILTER : r.verdict!=="SKIP");
+  let rows=scoped.filter(r=> VFILTER? r.verdict===VFILTER : (VSTATUS!=="active"||r.verdict!=="SKIP"));
   if(onlyFresh)rows=rows.filter(r=>r.fresh);
   if(onlyMarked)rows=rows.filter(r=>mk.has(String(r.id)));
   const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
@@ -1308,18 +1362,24 @@ async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
   let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
   for(const r of rows){const id=String(r.id);const on=mk.has(id);
     const expc=r.over_experience?' class="hl nowrap"':' class="nowrap"';
-    const badges=(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"")+(r.applied?'<span class="badge applied">откликнулся</span>':"");
+    const badges=(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"")
+      +(r.applied?'<span class="badge applied">откликнулся</span>':"")+(r.viewed?'<span class="badge">просмотрено</span>':"")+(r.bad?'<span class="badge" style="color:var(--skip)">плохая</span>':"");
     const status=r.blocked?'<span class="muted">откликался</span>':(r.applied?'<span class="muted">отмечен</span>':esc(r.db_status||""));
+    const badBtn=r.bad?`<button class="ghost mini" onclick="markBad('${id}',false)">вернуть</button>`
+      :`<button class="ghost mini" title="пометить как не то" onclick="markBad('${id}',true)">👎 плохая</button>`;
     h+=`<tr><td><span class="star ${on?"on":""}" onclick="toggleMark('${id}')">${on?"★":"☆"}</span></td>
       <td><span class="pill ${r.verdict}">${r.verdict||"?"}</span></td>
       <td class="nowrap">${r.fit_score??""}</td>
       <td${expc} title="${r.over_experience?'требуемый опыт выше твоего':''}">${esc(r.exp_label||"—")}</td>
       <td class="muted nowrap">${esc(r.salary_label||"—")}</td>
-      <td><a href="${r.url}" target="_blank">${esc(r.name)}</a>${badges}<div class="muted">${esc(r.company||"")}</div></td>
+      <td><a href="${r.url}" target="_blank" onclick="markViewed('${id}')">${esc(r.name)}</a>${badges}<div class="muted">${esc(r.company||"")}</div></td>
       <td class="reason">${esc(r.reason||"")}</td>
       <td class="nowrap">${status}</td>
-      <td><button class="ghost mini" onclick="genLetter('${tr}','${id}','${encodeURIComponent(r.url||"")}')">Письмо</button></td></tr>`;}
+      <td class="nowrap"><button class="ghost mini" onclick="genLetter('${tr}','${id}','${encodeURIComponent(r.url||"")}')">Письмо</button> ${badBtn}</td></tr>`;}
   $("#vtable").innerHTML=h+"</table>";}
+async function markViewed(id){try{await api("/api/viewed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});}catch(e){}
+  setTimeout(loadVac,600);}
+async function markBad(id,on){await api("/api/bad",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,on})});loadVac();}
 ["vtrack","vfresh","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
 
 /* ---- apply queue ---- */
@@ -1463,7 +1523,8 @@ async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").va
 /* ---- letter modal ---- */
 let modalCtx={track:"",id:""};
 function closeModal(){$("#modal").classList.add("hide");}
-function openHH(){const u=$("#modal").dataset.url;if(u)window.open(u,"_blank");}
+function openHH(){const u=$("#modal").dataset.url;if(u)window.open(u,"_blank");
+  if(modalCtx.id){try{api("/api/viewed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:modalCtx.id})});}catch(e){}}}
 function copyLetter(){const t=$("#lettertext").value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(()=>$("#letterhint").textContent="скопировано ✓").catch(()=>$("#letterhint").textContent="не удалось скопировать");}
 function copyAndOpen(){copyLetter();openHH();}
 async function markApplied(){if(!modalCtx.id)return;
