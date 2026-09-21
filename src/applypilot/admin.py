@@ -212,6 +212,44 @@ class AdminApp:
             }
         return result
 
+    def spend(self) -> dict[str, Any]:
+        """Aggregate the LLM spend ledger for the stats panel."""
+        path = self.config.data_dir / "spend.jsonl"
+        today = time.strftime("%Y-%m-%d")
+        by_day: dict[str, float] = {}
+        total = 0.0
+        calls = 0
+        balance: float | None = None
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cost = float(row.get("cost_rub") or 0)
+                day = str(row.get("date") or "")
+                by_day[day] = round(by_day.get(day, 0.0) + cost, 4)
+                total += cost
+                calls += 1
+                if row.get("balance") is not None:
+                    balance = float(row["balance"])
+        days = sorted(by_day.items())[-14:]
+        return {
+            "balance": balance,
+            "today_rub": round(by_day.get(today, 0.0), 2),
+            "total_rub": round(total, 2),
+            "calls": calls,
+            "by_day": [{"date": d, "rub": round(v, 2)} for d, v in days],
+        }
+
+    def verdict_stats(self) -> dict[str, Any]:
+        out = {}
+        for track, cfg in TRACKS.items():
+            report = _read_json(self.root / cfg["screen_report"]) or {}
+            out[track] = {"label": cfg["label"],
+                          "counts": report.get("counts") if isinstance(report, dict) else None}
+        return out
+
     def vacancies(self, track: str) -> dict[str, Any]:
         if track not in TRACKS:
             return {"error": "unknown track"}
@@ -326,6 +364,8 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.runner.status() or {})
             elif parsed.path == "/api/settings":
                 self._send(200, app.settings_public())
+            elif parsed.path == "/api/stats":
+                self._send(200, {"spend": app.spend(), "verdicts": app.verdict_stats()})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -404,6 +444,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <div class="tab active" data-t="overview">Обзор</div>
 <div class="tab" data-t="vac">Вакансии</div>
 <div class="tab" data-t="apply">Отклики</div>
+<div class="tab" data-t="stats">Статистика</div>
 <div class="tab" data-t="log">Лог</div>
 <div class="tab" data-t="settings">Настройки</div>
 </div>
@@ -415,7 +456,8 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
   <div class="row"><label>Трек</label>
     <select id="vtrack"><option value="ai">AI / LLM</option><option value="infra">DevOps / инфраструктура</option></select>
     <label>Вердикт</label>
-    <select id="vfilter"><option value="">все</option><option>FIT</option><option>MAYBE</option><option>SKIP</option></select>
+    <select id="vfilter"><option value="">все</option><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>ERROR</option></select>
+    <label><input type="checkbox" id="vshowskip"> показывать SKIP</label>
     <button class="ghost" onclick="loadVac()">Обновить</button>
     <span id="vmeta" class="muted"></span></div>
   <div id="vtable"></div>
@@ -434,6 +476,11 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <p class="muted">Реальная отправка требует галки и <code>reviewed = true</code> в профиле трека.</p>
   </div>
 </section>
+<section id="stats" class="hide">
+  <div class="grid" id="spendcards"></div>
+  <div class="card" style="margin-top:12px"><h3>Расход по дням, ₽</h3><div id="spendbars"></div></div>
+  <div class="card" style="margin-top:12px"><h3>Вердикты по трекам</h3><div id="verdictbars"></div></div>
+</section>
 <section id="log" class="hide"><div class="row"><button class="ghost" onclick="refreshJob()">Обновить</button><button class="danger" onclick="stopJob()">Стоп</button></div><pre id="logbox">—</pre></section>
 <section id="settings" class="hide">
   <div class="card" style="max-width:640px">
@@ -451,8 +498,8 @@ const $=s=>document.querySelector(s);
 let tab="overview";
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{tab=t.dataset.t;
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x===t));
-  ["overview","vac","apply","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!==tab));
-  if(tab==="overview")loadOverview(); if(tab==="vac")loadVac(); if(tab==="settings")loadSettings();});
+  ["overview","vac","apply","stats","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!==tab));
+  if(tab==="overview")loadOverview(); if(tab==="vac")loadVac(); if(tab==="settings")loadSettings(); if(tab==="stats")loadStats();});
 async function api(p,opt){const r=await fetch(p,opt);return r.json();}
 async function loadOverview(){const d=await api("/api/overview");
   let h='<div class="grid">';
@@ -474,21 +521,32 @@ async function job(action,track){const body={action,track:track||$("#atrack")?.v
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;} tab="log";
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t==="log"));
-  ["overview","vac","apply","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!=="log"));refreshJob();}
+  ["overview","vac","apply","stats","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!=="log"));refreshJob();}
 async function loadSettings(){const s=await api("/api/settings");
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
   $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";}
 async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value};const k=$("#skey").value.trim();if(k)body.api_key=k;
   const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено";}
+async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
+  $("#spendcards").innerHTML=card("Баланс, ₽",sp.balance!=null?sp.balance:"—")+card("Сегодня, ₽",sp.today_rub??0)+card("Всего, ₽",sp.total_rub??0)+card("Запросов",sp.calls??0);
+  const days=sp.by_day||[];const mx=Math.max(1,...days.map(d=>d.rub));
+  $("#spendbars").innerHTML=days.map(d=>bar(d.date,d.rub,mx,'var(--accent)','₽')).join("")||'<span class="muted">нет данных</span>';
+  let vh="";const vd=s.verdicts||{};for(const k in vd){const t=vd[k],c=t.counts;
+    if(!c){vh+=`<div class="muted" style="margin:8px 0">${t.label}: нет отчёта</div>`;continue;}
+    const tot=Math.max(1,(c.FIT||0)+(c.MAYBE||0)+(c.SKIP||0)+(c.ERROR||0));
+    vh+=`<div style="margin:10px 0"><b>${t.label}</b>`+seg('FIT',c.FIT||0,tot,'var(--fit)')+seg('MAYBE',c.MAYBE||0,tot,'var(--maybe)')+seg('SKIP',c.SKIP||0,tot,'var(--skip)')+seg('ERROR',c.ERROR||0,tot,'var(--mut)')+`</div>`;}
+  $("#verdictbars").innerHTML=vh;}
+function bar(label,val,mx,color,unit){const w=Math.round(100*val/mx);return `<div class="row" style="gap:8px"><span class="muted" style="width:96px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:64px;text-align:right">${val}${unit||''}</span></div>`;}
+function seg(label,val,tot,color){const w=Math.round(100*val/tot);return `<div class="row" style="gap:8px"><span class="muted" style="width:70px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:40px;text-align:right">${val}</span></div>`;}
 async function refreshJob(){const j=await api("/api/job");
   $("#logbox").textContent=(j.lines||[]).join("\\n")||"—";
   $("#jobstate").textContent=j.label?(j.label+(j.running?" ▶ идёт":(" ✓ код "+j.returncode))):"";
   return !!j.running;}
 async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
-async function loadVac(){const tr=$("#vtrack").value,f=$("#vfilter").value;const d=await api("/api/vacancies?track="+tr);
-  $("#vmeta").textContent=`модель ${d.model||"—"} · ${d.count||0} вакансий`;
-  let rows=(d.rows||[]).filter(r=>!f||r.verdict===f);
+async function loadVac(){const tr=$("#vtrack").value,f=$("#vfilter").value,showskip=$("#vshowskip").checked;const d=await api("/api/vacancies?track="+tr);
+  let rows=(d.rows||[]).filter(r=> f ? r.verdict===f : (showskip || r.verdict!=="SKIP"));
+  $("#vmeta").textContent=`модель ${d.model||"—"} · показано ${rows.length} из ${d.count||0}`;
   let h='<table><tr><th>Вердикт</th><th>fit</th><th>score</th><th>Вакансия</th><th>Причина</th><th>Статус</th></tr>';
   for(const r of rows){h+=`<tr><td><span class="pill ${r.verdict}">${r.verdict||"?"}</span></td>
     <td>${r.fit_score??""}</td><td>${r.score??""}</td>

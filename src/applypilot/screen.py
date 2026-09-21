@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -177,6 +178,24 @@ def screen_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
+def _append_ledger(path: Path, lock: threading.Lock, usage: dict[str, Any], model: str) -> None:
+    """Append one spend record (cost + last known balance) for the admin panel."""
+    cost = usage.get("cost_rub")
+    if cost is None:
+        return
+    line = json.dumps({
+        "ts": time.time(), "date": time.strftime("%Y-%m-%d"),
+        "cost_rub": cost, "balance": usage.get("balance"), "model": model,
+    }, ensure_ascii=False)
+    try:
+        with lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except OSError:
+        pass
+
+
 def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
                   messages: list[dict[str, str]], deadline: float, max_retries: int = 5) -> dict[str, Any]:
     """POST one screening request with exponential backoff.
@@ -202,8 +221,9 @@ def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
                 last_error = ScreenError(f"HTTP {status}: rate limited or unavailable")
             else:
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-                return parse_verdict(content)
+                body = response.json()
+                content = body["choices"][0]["message"]["content"]
+                return parse_verdict(content), (body.get("usage") or {})
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             last_error = exc
         # Jittered exponential backoff before the next attempt.
@@ -221,6 +241,7 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
                      per_item_deadline: float = 150.0, api_key: str | None = None,
                      post: Callable[..., Any] | None = None,
                      on_result: Callable[[dict[str, Any], int, int], None] | None = None,
+                     ledger_path: Path | None = None,
                      ) -> list[dict[str, Any]]:
     """Screen vacancies with the configured model; results merge item basics + verdict.
 
@@ -245,6 +266,7 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
     owns_client = post is None
     client = httpx.Client(timeout=httpx.Timeout(10.0, read=90.0)) if owns_client else None
     do_post = client.post if client is not None else post
+    ledger_lock = threading.Lock()
 
     def run(item: dict[str, Any]) -> dict[str, Any]:
         base = {"id": str(item.get("id", "")), "name": item.get("name", ""),
@@ -259,14 +281,16 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
                 pass
         messages = screen_messages(item, candidate, rubric)
         try:
-            verdict = _post_verdict(do_post, base_url, model, key, messages,
-                                    time.monotonic() + per_item_deadline)
+            verdict, usage = _post_verdict(do_post, base_url, model, key, messages,
+                                           time.monotonic() + per_item_deadline)
         except ScreenError as exc:
             # A transport/parse failure is NOT a real verdict: mark ERROR so it is
             # never accepted for applying and gets retried on the next run.
             return {**base, "verdict": "ERROR", "fit_score": 0,
                     "reason": f"скрининг недоступен: {str(exc)[:120]}", "source": "error"}
         path.write_text(json.dumps(verdict, ensure_ascii=False), encoding="utf-8")
+        if ledger_path is not None:
+            _append_ledger(ledger_path, ledger_lock, usage, model)
         return {**base, **verdict, "source": "generated"}
 
     results: list[dict[str, Any]] = []

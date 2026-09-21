@@ -651,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
             results = screen_vacancies(
                 to_screen, profile, config.data_dir / "screen-cache",
                 model=model, base_url=base_url, track=args.track, concurrency=concurrency,
-                on_result=_on_result,
+                on_result=_on_result, ledger_path=config.data_dir / "spend.jsonl",
             )
         except ScreenError as exc:
             print(f"screen: error ({exc})", file=sys.stderr)
