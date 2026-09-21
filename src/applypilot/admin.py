@@ -12,9 +12,11 @@ explicit confirm and ``reviewed = true`` in the profile.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,6 +46,7 @@ OVER_EXPERIENCE = {"between3And6", "moreThan6"}
 
 TRACKS_CONFIG = "private/config/tracks.toml"
 RUBRIC_TYPES = ("ai", "infra", "general")
+WATCH_TIMER = "applypilot-watch.timer"
 
 # Fallback used only when private/config/tracks.toml is absent; it is written to
 # disk on first load so the operator can edit / add tracks there.
@@ -249,6 +252,11 @@ def _clean_resume_titles(raw: list[str]) -> list[str]:
     return result
 
 
+def _disp(value: Any) -> str:
+    """Decode HTML entities in scanned text so the UI doesn't double-escape them."""
+    return html.unescape(str(value or ""))
+
+
 def _exp_label(value: str) -> str:
     return EXPERIENCE_LABELS.get(str(value or ""), "—")
 
@@ -441,11 +449,16 @@ class AdminApp:
                        for r in top if r.get("verdict") == "FIT"][:6]
             fresh_count = sum(1 for r in top if r.get("fresh")
                               and r.get("verdict") in ("FIT", "MAYBE"))
+            # Unique (deduplicated) counts so overview matches the vacancies view.
+            uniq: dict[str, int] = {"FIT": 0, "MAYBE": 0, "SKIP": 0, "ERROR": 0}
+            for r in top:
+                uniq[r.get("verdict", "")] = uniq.get(r.get("verdict", ""), 0) + 1
             accepted = _read_json(self.root / cfg["accepted"]) or {}
             result["tracks"][track] = {
                 "label": cfg["label"],
                 "reviewed": bool(profile.get("reviewed", False)),
                 "counts": report.get("counts") if isinstance(report, dict) else None,
+                "counts_unique": uniq,
                 "accepted": len(accepted.get("items", [])) if isinstance(accepted, dict) else 0,
                 "has_report": bool(report),
                 "top_fit": top_fit,
@@ -501,13 +514,17 @@ class AdminApp:
         store = Store(self.config.db_path)
         statuses = store.read_statuses("hh-primary") if self.config.db_path.exists() else {}
         blocked = store.blocked_ids("hh-primary") if self.config.db_path.exists() else set()
+        applied = self._manual_applied()
         rows = []
         for row in results:
             vid = str(row.get("id", ""))
             rows.append({
                 **row,
+                "name": _disp(row.get("name", "")),
+                "company": _disp(row.get("company", "")),
                 "db_status": statuses.get(vid, ""),
                 "blocked": vid in blocked,
+                "applied": vid in applied,
                 "exp_label": _exp_label(row.get("experience", "")),
                 "over_experience": str(row.get("experience", "")) in OVER_EXPERIENCE,
                 "salary_label": _salary_label(row.get("salary")),
@@ -580,10 +597,13 @@ class AdminApp:
         elif action == "analytics":
             argv = base + ["analytics"]
         elif action in {"apply_dry", "apply_run"}:
-            accepted = self.root / cfg["accepted"]
-            if not accepted.exists():
-                return False, "no accepted snapshot yet; run screen first"
-            argv = base + gflags + ["apply", "--input", cfg["accepted"]]
+            if not (self.root / cfg["accepted"]).exists():
+                return False, "нет отобранных вакансий — сначала запусти скрининг"
+            mode = str(body.get("mode", "all"))
+            input_path = self._build_apply_input(track, mode, body.get("marked"))
+            if input_path is None:
+                return False, "очередь пуста: нет вакансий под выбранный фильтр"
+            argv = base + gflags + ["apply", "--input", str(input_path)]
             limit = int(body.get("limit") or 10)
             argv += ["--limit", str(max(1, limit))]
             if action == "apply_dry":
@@ -713,9 +733,9 @@ class AdminApp:
             return
         rt = json.dumps(resume or "ЗАПОЛНИ: точное название резюме на HH", ensure_ascii=False)
         text = (
-            '# Профиль нового трека. Заполни [professional] данными из резюме (PDF),\n'
+            '# Профиль нового трека. Заполни [professional] и name данными из резюме (PDF),\n'
             '# проверь [resumes] (точное название резюме на HH) и лимиты. reviewed=false.\n'
-            'name = "Артём Остапов"\nlocation = "Москва"\nenglish_level = "B1"\n'
+            'name = "ЗАПОЛНИ: ФИО кандидата"\nlocation = "ЗАПОЛНИ: город"\nenglish_level = "B1"\n'
             'reviewed = false\naccount = "hh-primary"\n\n'
             '[limits]\nper_run = 15\nper_day = 40\n\n'
             '[apply]\ndelay_min_seconds = 20\ndelay_max_seconds = 45\n'
@@ -745,6 +765,153 @@ class AdminApp:
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+
+    # ---- manual "applied" set (assisted-loop closure) ------------------
+    def _applied_path(self) -> Path:
+        return self.config.data_dir / "manual-applied.json"
+
+    def _manual_applied(self) -> set[str]:
+        data = _read_json(self._applied_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_applied(self, vid: str, on: bool = True) -> dict[str, Any]:
+        s = self._manual_applied()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._applied_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "applied": len(s), "on": on}
+
+    # ---- apply queue (what a run will actually send to) ----------------
+    def apply_queue(self, track: str, mode: str = "all", limit: int = 10,
+                    marked: list[str] | None = None) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        rows = self.vacancies(track).get("rows", [])
+        marks = {str(m) for m in (marked or [])}
+        accepted = [r for r in rows if r.get("verdict") in ("FIT", "MAYBE")]
+        if mode == "fit":
+            accepted = [r for r in accepted if r.get("verdict") == "FIT"]
+        elif mode == "marked":
+            accepted = [r for r in accepted if str(r.get("id")) in marks]
+        queue = [{"id": str(r.get("id")), "name": r.get("name"), "company": r.get("company"),
+                  "url": r.get("url"), "verdict": r.get("verdict"), "fit_score": r.get("fit_score"),
+                  "exp_label": r.get("exp_label"), "over_experience": r.get("over_experience"),
+                  "salary_label": r.get("salary_label"), "blocked": r.get("blocked"),
+                  "applied": r.get("applied")} for r in accepted]
+        sendable = [q for q in queue if not q["blocked"] and not q["applied"]]
+        reviewed = bool(_profile_flag(self.root, track).get("reviewed", False))
+        return {"track": track, "mode": mode, "limit": limit, "reviewed": reviewed,
+                "total": len(queue), "sendable": len(sendable),
+                "will_send": min(int(limit), len(sendable)), "rows": queue}
+
+    def _build_apply_input(self, track: str, mode: str, marked: list[str] | None) -> Path | None:
+        """Write a filtered snapshot (by mode) for `apply --input`; None on empty."""
+        cfg = TRACKS[track]
+        accepted = _read_json(self.root / cfg["accepted"]) or {}
+        items = accepted.get("items", []) if isinstance(accepted, dict) else []
+        report = _read_json(self.root / cfg["screen_report"]) or {}
+        verdict_by = {str(r.get("id")): r.get("verdict") for r in report.get("results", [])}
+        marks = {str(m) for m in (marked or [])}
+        applied = self._manual_applied()
+        keep = []
+        for it in items:
+            vid = str(it.get("id"))
+            if vid in applied:
+                continue
+            if mode == "fit" and verdict_by.get(vid) != "FIT":
+                continue
+            if mode == "marked" and vid not in marks:
+                continue
+            keep.append(it)
+        if not keep:
+            return None
+        path = self.config.data_dir / "snapshots" / f"apply-input-{track}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 3, "source": "hh.ru", "status": "ok",
+                                    "query": f"apply:{track}:{mode}", "items": keep},
+                                   ensure_ascii=False), encoding="utf-8")
+        return path
+
+    # ---- watch timer (systemd user unit) -------------------------------
+    def watch_status(self) -> dict[str, Any]:
+        def sc(*args: str) -> str:
+            try:
+                return subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                                      text=True, timeout=6, check=False).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        installed = (Path.home() / ".config/systemd/user" / WATCH_TIMER).exists()
+        log = self.config.data_dir / "watch.log"
+        tail = ""
+        if log.exists():
+            try:
+                tail = "\n".join(log.read_text(encoding="utf-8").splitlines()[-6:])
+            except OSError:
+                tail = ""
+        return {"installed": installed,
+                "active": sc("is-active", WATCH_TIMER) if installed else "inactive",
+                "enabled": sc("is-enabled", WATCH_TIMER) if installed else "disabled",
+                "interval_min": self._watch_interval(installed),
+                "next": sc("show", WATCH_TIMER, "-p", "NextElapseUSecRealtime", "--value")
+                if installed else "",
+                "systemctl": bool(shutil.which("systemctl")), "log_tail": tail}
+
+    def _watch_interval(self, installed: bool = True) -> int:
+        src = (Path.home() / ".config/systemd/user" / WATCH_TIMER) if installed else \
+            (self.root / "packaging" / WATCH_TIMER)
+        try:
+            m = re.search(r"OnUnitActiveSec\s*=\s*(\d+)\s*(min|h|s)?", src.read_text(encoding="utf-8"))
+            if m:
+                n, unit = int(m.group(1)), (m.group(2) or "s")
+                return n * 60 if unit == "h" else (n if unit == "min" else max(1, n // 60))
+        except OSError:
+            pass
+        return 60
+
+    def watch_control(self, action: str, minutes: int | None = None) -> dict[str, Any]:
+        if not shutil.which("systemctl"):
+            return {"error": "systemctl не найден — используйте cron (см. packaging/README)"}
+        dst_dir = Path.home() / ".config/systemd/user"
+        src_dir = self.root / "packaging"
+        out: list[str] = []
+
+        def sc(*args: str) -> tuple[int, str]:
+            try:
+                r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                                   text=True, timeout=15, check=False)
+                return r.returncode, (r.stdout + r.stderr).strip()
+            except (OSError, subprocess.SubprocessError) as exc:
+                return 1, str(exc)
+
+        try:
+            if action in ("install", "interval"):
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                # service: point APPLYPILOT_HOME at this repo
+                svc = (src_dir / "applypilot-watch.service").read_text(encoding="utf-8")
+                svc = re.sub(r"APPLYPILOT_HOME=\S+", f"APPLYPILOT_HOME={self.root}", svc)
+                if f"APPLYPILOT_HOME={self.root}" not in svc:
+                    svc = svc.replace("[Service]", f"[Service]\nEnvironment=APPLYPILOT_HOME={self.root}", 1)
+                (dst_dir / "applypilot-watch.service").write_text(svc, encoding="utf-8")
+                tmr = (src_dir / WATCH_TIMER).read_text(encoding="utf-8")
+                mins = max(5, int(minutes or self._watch_interval(False)))
+                tmr = re.sub(r"OnUnitActiveSec\s*=\s*\S+", f"OnUnitActiveSec={mins}min", tmr)
+                (dst_dir / WATCH_TIMER).write_text(tmr, encoding="utf-8")
+                sc("daemon-reload")
+                out.append(f"units → {dst_dir}, интервал {mins} мин")
+            if action in ("install", "enable"):
+                rc, msg = sc("enable", "--now", WATCH_TIMER)
+                out.append(msg or ("включён" if rc == 0 else "не удалось включить"))
+            elif action == "interval":
+                sc("restart", WATCH_TIMER)
+                out.append("интервал обновлён")
+            elif action == "disable":
+                rc, msg = sc("disable", "--now", WATCH_TIMER)
+                out.append(msg or "выключен")
+        except OSError as exc:
+            return {"error": str(exc)[:200]}
+        return {"ok": True, "message": "; ".join(o for o in out if o) or "готово",
+                "status": self.watch_status()}
 
 
 def _track_queries(root: Path, track: str) -> set[str]:
@@ -801,6 +968,8 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/api/resumes":
                 refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
                 self._send(200, app.tracks_overview(refresh=refresh))
+            elif parsed.path == "/api/watch":
+                self._send(200, app.watch_status())
             else:
                 self._send(404, {"error": "not found"})
 
@@ -820,6 +989,17 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.letter(str(b.get("track", "ai")), str(b.get("id", ""))))
             elif parsed.path == "/api/track":
                 res = app.add_track(body if isinstance(body, dict) else {})
+                self._send(200 if res.get("ok") else 400, res)
+            elif parsed.path == "/api/queue":
+                b = body if isinstance(body, dict) else {}
+                self._send(200, app.apply_queue(str(b.get("track", "ai")), str(b.get("mode", "all")),
+                                                 int(b.get("limit") or 10), b.get("marked")))
+            elif parsed.path == "/api/applied":
+                b = body if isinstance(body, dict) else {}
+                self._send(200, app.mark_applied(str(b.get("id", "")), bool(b.get("on", True))))
+            elif parsed.path == "/api/watch":
+                b = body if isinstance(body, dict) else {}
+                res = app.watch_control(str(b.get("action", "")), b.get("minutes"))
                 self._send(200 if res.get("ok") else 400, res)
             else:
                 self._send(404, {"error": "not found"})
@@ -858,55 +1038,83 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
 
 
 
+
 INDEX_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApplyPilot admin</title>
 <style>
-:root{--bg:#0f1216;--card:#1a1f27;--card2:#20262f;--fg:#e7ecf3;--mut:#93a1b3;--line:#2b333f;--fit:#2fbf71;--maybe:#e2b13c;--skip:#e15c5c;--accent:#4c8dff;--warn:#f0883e;--star:#ffd23f}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
-header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:center;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:20}
-h1{font-size:16px;margin:0;font-weight:650}
-.tabs{display:flex;gap:6px;flex-wrap:wrap}.tab{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer;color:var(--fg)}
+:root{--bg:#0f1216;--card:#1a1f27;--card2:#20262f;--fg:#e7ecf3;--mut:#93a1b3;--line:#2b333f;
+--fit:#2fbf71;--maybe:#e2b13c;--skip:#e15c5c;--accent:#4c8dff;--warn:#f0883e;--star:#ffd23f;--hdr:60px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif}
+header{padding:10px 18px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:center;
+flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:30}
+h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer;color:var(--fg);font-size:13px}
 .tab.active{border-color:var(--accent);color:#fff;background:#223049}
-.bal{margin-left:auto;display:flex;gap:14px;align-items:center}
+.bal{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:13px}
 .bal b{color:var(--fit)}
-main{padding:18px;max-width:1220px;margin:0 auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
-.card h3{margin:0 0 8px;font-size:13px;color:var(--mut);font-weight:600}
-.big{font-size:22px;font-weight:700}
-button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:13px}
+main{padding:18px;max-width:1480px;margin:0 auto}
+.grid{display:grid;gap:12px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.two{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+.card h3{margin:0 0 10px;font-size:12px;color:var(--mut);font-weight:700;text-transform:uppercase;letter-spacing:.6px}
+.big{font-size:24px;font-weight:750;line-height:1.1}
+.sub{color:var(--mut);font-size:12px;margin-top:4px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 13px;cursor:pointer;font-size:13px}
 button.ghost{background:var(--card2);border:1px solid var(--line);color:var(--fg)}
-button.mini{padding:4px 9px;font-size:12px}
-button.danger{background:var(--skip)}button:disabled{opacity:.5;cursor:not-allowed}
+button.mini{padding:5px 10px;font-size:12px}
+button.danger{background:var(--skip)}
+button:disabled{opacity:.45;cursor:not-allowed}
 label{color:var(--mut);font-size:12px}
-input,select,textarea{background:#11151b;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:6px;font-family:inherit}
-table{width:100%;border-collapse:collapse;margin-top:10px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--mut);font-weight:600;font-size:12px;position:sticky;top:57px;background:var(--bg)}
+input,select,textarea{background:#11151b;border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:7px 8px;font-family:inherit;font-size:13px}
+textarea{resize:vertical;width:100%;line-height:1.5}
+.field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.field>label{font-weight:600}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin-top:12px}
+table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:600;font-size:12px;position:sticky;top:var(--hdr);background:#151a21;z-index:1}
 tr:hover td{background:#151b22}
-.pill{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
-.FIT{background:rgba(47,191,113,.16);color:var(--fit)}.MAYBE{background:rgba(226,177,60,.16);color:var(--maybe)}
-.SKIP{background:rgba(225,92,92,.16);color:var(--skip)}.ERROR{background:rgba(147,161,179,.16);color:var(--mut)}
+td.nowrap,th.nowrap{white-space:nowrap}
+td.reason{color:var(--mut);max-width:44ch}
+.pill{padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;display:inline-block}
+.FIT{background:rgba(47,191,113,.16);color:var(--fit)}
+.MAYBE{background:rgba(226,177,60,.16);color:var(--maybe)}
+.SKIP{background:rgba(225,92,92,.16);color:var(--skip)}
+.ERROR{background:rgba(147,161,179,.16);color:var(--mut)}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0}
-pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:420px;overflow:auto;white-space:pre-wrap}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:70vh;overflow:auto;white-space:pre-wrap;margin:0}
 .muted{color:var(--mut)}.hide{display:none}.hl{color:var(--warn)}
-.badge{font-size:11px;padding:1px 6px;border-radius:5px;background:var(--card2);border:1px solid var(--line);color:var(--mut);margin-left:6px}
+.badge{font-size:11px;padding:1px 7px;border-radius:6px;background:var(--card2);border:1px solid var(--line);color:var(--mut);margin-left:6px;white-space:nowrap;display:inline-block}
 .fresh{color:var(--fit);border-color:rgba(47,191,113,.4)}
-.star{cursor:pointer;font-size:16px;color:#3a434f;user-select:none}.star.on{color:var(--star)}
-.tf{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.applied{color:var(--accent);border-color:rgba(76,141,255,.4)}
+.star{cursor:pointer;font-size:17px;color:#3a434f;user-select:none}.star.on{color:var(--star)}
+.tf{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
 .tf:last-child{border-bottom:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:var(--card);border:0;border-right:1px solid var(--line);border-radius:0;color:var(--mut);font-weight:600}
+.seg button:last-child{border-right:0}
+.seg button.on{background:#223049;color:#fff}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:8px 0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:0}
+.settings-grid{display:grid;grid-template-columns:minmax(320px,1fr) 2fr;gap:16px;align-items:start}
+@media(max-width:1000px){.settings-grid{grid-template-columns:1fr}}
+.qrow.send{background:rgba(47,191,113,.07)}
+.chip{display:inline-block;padding:3px 10px;border-radius:999px;background:var(--card2);border:1px solid var(--line);font-size:12px;margin-right:6px}
+.stack>*+*{margin-top:14px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
 .modal.hide{display:none}
-.modal .box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;max-width:700px;width:100%;max-height:88vh;overflow:auto}
-.modal h3{margin:0 0 6px}
+.modal .box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;max-width:720px;width:100%;max-height:90vh;overflow:auto}
+.modal h3{margin:0 0 6px;text-transform:none;font-size:16px;color:var(--fg)}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
 </style></head><body>
 <header><h1>ApplyPilot</h1>
-<div class="tabs">
+<div class="tabs" id="tabs">
 <div class="tab active" data-t="overview">Обзор</div>
 <div class="tab" data-t="vac">Вакансии</div>
 <div class="tab" data-t="apply">Отклики</div>
@@ -921,35 +1129,26 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <section id="overview"></section>
 
 <section id="vac" class="hide">
-  <div class="row"><label>Трек</label>
-    <select id="vtrack"></select>
-    <label>Вердикт</label>
-    <select id="vfilter"><option value="">все</option><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>ERROR</option></select>
-    <label><input type="checkbox" id="vshowskip"> показывать SKIP</label>
-    <label><input type="checkbox" id="vfresh"> только свежие</label>
-    <label><input type="checkbox" id="vmarked"> только отмеченные ★</label>
+  <div class="row"><label>Трек</label><select id="vtrack"></select>
+    <span class="seg" id="vseg"></span>
+    <label><input type="checkbox" id="vfresh"> свежие</label>
+    <label><input type="checkbox" id="vmarked"> отмеченные ★</label>
     <button class="ghost mini" onclick="loadVac()">Обновить</button>
     <span id="vmeta" class="muted"></span></div>
-  <div id="vtable"></div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--fit)"></span>FIT — подходит</span>
+    <span><span class="dot" style="background:var(--maybe)"></span>MAYBE — на грани</span>
+    <span><span class="dot" style="background:var(--skip)"></span>SKIP — мимо</span>
+    <span><span class="dot" style="background:var(--warn)"></span>опыт выше твоего</span>
+    <span><span class="dot" style="background:var(--fit)"></span>свежая · ★ пометить</span>
+  </div>
+  <div class="tablewrap"><div id="vtable"></div></div>
 </section>
 
-<section id="apply" class="hide">
-  <div class="card" style="max-width:660px">
-    <h3>Запуск откликов</h3>
-    <div class="row"><label>Трек</label>
-      <select id="atrack"></select>
-      <label>Лимит</label><input id="alimit" type="number" value="10" style="width:80px">
-      <label>Target success</label><input id="atarget" type="number" value="" placeholder="—" style="width:80px"></div>
-    <div class="row"><button class="ghost" onclick="job('apply_dry')">Dry-run (безопасно)</button></div>
-    <hr style="border-color:var(--line)">
-    <div class="row"><input type="checkbox" id="aconfirm"><label for="aconfirm">Подтверждаю реальную отправку откликов работодателям</label></div>
-    <div class="row"><button class="danger" onclick="job('apply_run')">Отправить реальные отклики</button></div>
-    <p class="muted">Реальная отправка требует галки и <code>reviewed = true</code> в профиле трека. Отклики необратимы.</p>
-  </div>
-</section>
+<section id="apply" class="hide"></section>
 
 <section id="stats" class="hide">
-  <div class="grid" id="spendcards"></div>
+  <div class="grid kpis" id="spendcards"></div>
   <div class="card" style="margin-top:12px"><h3>Расход по дням, ₽</h3><div id="spendbars"></div></div>
   <div class="card" style="margin-top:12px"><h3>Вердикты по трекам</h3><div id="verdictbars"></div></div>
 </section>
@@ -957,94 +1156,119 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <section id="tracks" class="hide">
   <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Активные резюме на HH и треки</h3>
     <button class="ghost mini" onclick="loadTracks(true)">Обновить с HH</button></div>
-    <p class="muted" id="tracksmeta">Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (может занять ~10с).</p>
-    <div id="trackstable"></div>
+    <p class="muted" id="tracksmeta">Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (~10с).</p>
+    <div class="tablewrap"><div id="trackstable"></div></div>
     <div id="unassigned"></div>
   </div>
-  <div class="card" style="margin-top:12px;max-width:680px"><h3>Добавить трек</h3>
-    <p class="muted">Создаст скелет profile-&lt;ключ&gt;.toml и search-&lt;ключ&gt;.toml. Дальше заполни в профиле блок [professional] данными из резюме (PDF) и проверь запросы.</p>
-    <div class="row"><label style="width:150px">Ключ (латиница)</label><input id="tkey" placeholder="напр. ml, backend" style="min-width:200px"></div>
-    <div class="row"><label style="width:150px">Название</label><input id="tlabel" placeholder="напр. ML Engineer" style="min-width:280px"></div>
-    <div class="row"><label style="width:150px">Рубрика</label><select id="ttype"></select></div>
-    <div class="row"><label style="width:150px">Резюме на HH</label><input id="tresume" placeholder="точное название резюме на HH" style="min-width:320px"></div>
-    <div class="row" style="align-items:flex-start"><label style="width:150px;margin-top:6px">Запросы (по строке)</label>
-      <textarea id="tqueries" rows="4" style="flex:1;min-width:280px" placeholder="LLM Engineer&#10;AI Agent Engineer&#10;RAG Engineer"></textarea></div>
-    <div class="row" style="align-items:flex-start"><label style="width:150px;margin-top:6px">Доп. правила скрининга</label>
-      <textarea id="tcriteria" rows="3" style="flex:1;min-width:280px" placeholder="необязательно"></textarea></div>
+  <div class="card" style="margin-top:12px"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Автопоиск свежих вакансий (таймер)</h3>
+    <button class="ghost mini" onclick="loadWatch()">Обновить статус</button></div>
+    <p class="muted">Регулярный скан свежих + скрининг для всех треков (systemd-таймер). Отклики остаются ручными. «Проверить свежие сейчас» доступно на вкладке «Обзор».</p>
+    <div id="watchbox" class="muted">загрузка…</div>
+  </div>
+  <div class="card" style="margin-top:12px;max-width:760px"><h3>Добавить трек</h3>
+    <p class="muted">Создаст скелет profile-&lt;ключ&gt;.toml и search-&lt;ключ&gt;.toml. Дальше заполни в профиле блок [professional] и ФИО данными из резюме (PDF) и проверь запросы.</p>
+    <div class="grid two">
+      <div class="field"><label>Ключ (латиница)</label><input id="tkey" placeholder="напр. ml, backend"></div>
+      <div class="field"><label>Название</label><input id="tlabel" placeholder="напр. ML Engineer"></div>
+      <div class="field"><label>Рубрика скрининга</label><select id="ttype"></select></div>
+      <div class="field"><label>Резюме на HH (точное название)</label><input id="tresume" placeholder="как в профиле HH"></div>
+    </div>
+    <div class="field"><label>Поисковые запросы (по одному в строке)</label>
+      <textarea id="tqueries" rows="4" placeholder="LLM Engineer&#10;AI Agent Engineer&#10;RAG Engineer"></textarea></div>
+    <div class="field"><label>Доп. правила скрининга (необязательно)</label><textarea id="tcriteria" rows="3"></textarea></div>
     <div class="row"><button onclick="addTrack()">Создать трек</button><span id="tmsg" class="muted"></span></div>
   </div>
 </section>
 
-<section id="log" class="hide"><div class="row"><button class="ghost mini" onclick="refreshJob()">Обновить</button><button class="danger mini" onclick="stopJob()">Стоп</button></div><pre id="logbox">—</pre></section>
+<section id="log" class="hide">
+  <div class="row"><span id="logmeta" class="muted"></span>
+    <button class="ghost mini" id="logrefresh" onclick="refreshJob()">Обновить</button>
+    <button class="danger mini" id="logstop" onclick="stopJob()">Стоп</button></div>
+  <pre id="logbox"></pre>
+</section>
 
 <section id="settings" class="hide">
-  <div class="card" style="max-width:680px">
-    <h3>Модель и ключ (LLM-скрининг и письма)</h3>
-    <div class="row"><label>Модель</label><select id="smodel" style="min-width:220px"></select></div>
-    <div class="row"><label>Base URL</label><input id="sbase" style="min-width:360px"></div>
-    <div class="row"><label>API-ключ</label><input id="skey" type="password" placeholder="sk-aitunnel-... (пусто — не менять)" style="min-width:360px"></div>
-    <p class="muted">Ключ хранится локально (права 600), в интерфейс не возвращается. У каждого пользователя — свой ключ.</p>
-    <h3 style="margin-top:14px">Кто кандидат и как оценивать</h3>
-    <div class="row"><label style="width:170px">Ограничения кандидата</label></div>
-    <textarea id="sconstraints" rows="4" style="width:100%" placeholder="опыт, метод работы, интервью, английский, формат"></textarea>
-    <div class="row" style="margin-top:8px"><label style="width:170px">Зарплатный ориентир</label></div>
-    <textarea id="ssalary" rows="2" style="width:100%" placeholder="напр.: ориентир от 100 000 ₽; вилки заметно ниже неинтересны"></textarea>
-    <div class="row" style="margin-top:8px"><label style="width:170px">Доп. правила скрининга (по трекам)</label></div>
-    <div id="scrit"></div>
-    <div class="row" style="margin-top:10px"><button onclick="saveSettings()">Сохранить</button><span id="skeystate" class="muted"></span></div>
+  <div class="settings-grid">
+    <div class="stack">
+      <div class="card"><h3>Модель и ключ (LLM: скрининг и письма)</h3>
+        <div class="field"><label>Модель</label><select id="smodel"></select></div>
+        <div class="field"><label>Base URL</label><input id="sbase"></div>
+        <div class="field"><label>API-ключ (пусто — не менять)</label><input id="skey" type="password" placeholder="sk-aitunnel-..."></div>
+        <p class="muted" style="margin:0">Ключ хранится локально (права 600), в интерфейс не возвращается. У каждого пользователя свой ключ.</p>
+      </div>
+      <div class="card"><h3>Статус</h3>
+        <div class="sub" id="sstatus"></div></div>
+    </div>
+    <div class="stack">
+      <div class="card"><h3>Кандидат</h3>
+        <div class="field"><label>Ограничения кандидата (опыт, метод работы, интервью, формат)</label>
+          <textarea id="sconstraints" style="min-height:180px"></textarea></div>
+        <div class="field"><label>Зарплатный ориентир</label>
+          <textarea id="ssalary" style="min-height:72px"></textarea></div>
+      </div>
+      <div class="card"><h3>Правила скрининга по трекам</h3>
+        <div id="scrit" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))"></div></div>
+    </div>
   </div>
+  <div class="row" style="margin-top:14px"><button onclick="saveSettings()">Сохранить настройки</button><span id="skeystate" class="muted"></span></div>
 </section>
 </main>
 
 <div id="modal" class="modal hide" onclick="if(event.target===this)closeModal()">
   <div class="box">
-    <h3>Сопроводительное письмо</h3>
-    <div class="muted" id="lettertitle" style="margin-bottom:8px"></div>
-    <textarea id="lettertext" rows="10" style="width:100%"></textarea>
-    <div class="row"><button onclick="copyLetter()">Копировать</button>
-      <button class="ghost" onclick="openHH()">Открыть вакансию на HH</button>
+    <h3 id="lettertitle">Сопроводительное письмо</h3>
+    <div class="muted" id="lettersub" style="margin-bottom:8px"></div>
+    <textarea id="lettertext" style="min-height:280px"></textarea>
+    <div class="row"><button onclick="copyAndOpen()">Копировать и открыть на HH</button>
+      <button class="ghost" onclick="copyLetter()">Копировать</button>
+      <button class="ghost" onclick="markApplied()">✓ Отметить: откликнулся</button>
       <button class="ghost" onclick="closeModal()">Закрыть</button>
       <span id="letterhint" class="muted"></span></div>
-    <p class="muted">Проверь и при необходимости поправь письмо. Отклик и отправку письма делаешь на HH сам (ассистированный режим).</p>
+    <p class="muted">Проверь и при необходимости поправь письмо. Отклик и отправку письма делаешь на HH сам (ассистированный режим). «Отметить» уберёт вакансию из очереди откликов.</p>
   </div>
 </div>
 
 <script>
 const $=s=>document.querySelector(s);
 const SECTIONS=["overview","vac","apply","stats","tracks","log","settings"];
-let tab="overview";let TRACKS=[];
-function show(t){tab=t;document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
-  SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));
-  if(t==="overview")loadOverview();if(t==="vac")loadVac();if(t==="settings")loadSettings();if(t==="stats")loadStats();if(t==="tracks")loadTracks(false);}
+let tab="overview",TRACKS=[],VFILTER="";
+function setHdr(){document.documentElement.style.setProperty('--hdr',(document.querySelector('header').offsetHeight)+'px');}
+addEventListener('resize',setHdr);
+function show(t){tab=t;location.hash=t;
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
+  SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));setHdr();
+  ({overview:loadOverview,vac:loadVac,apply:loadApply,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
 document.querySelectorAll(".tab").forEach(el=>el.onclick=()=>show(el.dataset.t));
 async function api(p,opt){const r=await fetch(p,opt);return r.json();}
 function esc(s){return (s||"").toString().replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 function rub(v){return v==null?"—":Number(v).toLocaleString("ru-RU");}
-
-/* ---- marks (localStorage) ---- */
 function marks(){try{return new Set(JSON.parse(localStorage.getItem("ap_marks")||"[]"))}catch(e){return new Set()}}
 function saveMarks(s){try{localStorage.setItem("ap_marks",JSON.stringify([...s]))}catch(e){}}
 function toggleMark(id){const s=marks();s.has(id)?s.delete(id):s.add(id);saveMarks(s);loadVac();}
+function fillTrackSelects(tracks){TRACKS=tracks||[];
+  for(const id of ["#vtrack","#atrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
+    sel.innerHTML=TRACKS.map(t=>`<option value="${t.key}">${esc(t.label)}</option>`).join("");
+    if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
+  const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
 
 /* ---- overview ---- */
 async function loadOverview(){const d=await api("/api/overview");
-  let h='<div class="grid">';
+  fillTrackSelects(Object.keys(d.tracks||{}).map(k=>({key:k,label:d.tracks[k].label})));
+  let h='<div class="grid kpis">';
   h+=card("Баланс, ₽",rub(d.balance),d.balance!=null?"aitunnel":"нет ключа");
   h+=card("Сессия HH",d.session_present?"есть":"нет");
-  h+=card("В блок-листе",d.blocked,"уже откликался");
-  h+='</div>';
-  h+='<div class="grid2" style="margin-top:12px">';
-  for(const k in d.tracks){const t=d.tracks[k];const c=t.counts||{};
-    h+=`<div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">${esc(t.label)}</h3>`
+  h+=card("В блок-листе",d.blocked,"уже откликался (исключены)");
+  h+='</div><div class="grid two" style="margin-top:12px">';
+  for(const k in d.tracks){const t=d.tracks[k];const c=t.counts_unique||t.counts||{};
+    h+=`<div class="card"><div class="row" style="justify-content:space-between;margin:0"><h3 style="margin:0">${esc(t.label)}</h3>`
       +(t.fresh_count?`<span class="badge fresh">🟢 свежих ${t.fresh_count}</span>`:"")+`</div>`
-      +`<div class="big">${t.accepted||0} <span class="muted" style="font-size:13px">в работе</span></div>`
-      +`<div class="row" style="gap:6px;margin:6px 0"><span class="pill FIT">FIT ${c.FIT??"–"}</span><span class="pill MAYBE">MAYBE ${c.MAYBE??"–"}</span><span class="pill SKIP">SKIP ${c.SKIP??"–"}</span>${c.ERROR?`<span class="pill ERROR">ERR ${c.ERROR}</span>`:""}</div>`
-      +`<div class="muted" style="margin-bottom:8px">reviewed: ${t.reviewed?"✅":"—"}</div>`
-      +`<div class="row"><button class="mini" onclick="gotoVac('${k}','FIT')">Показать FIT →</button>`
-      +`<button class="ghost mini" onclick="gotoVac('${k}','')">Все вакансии</button>`
-      +`<button class="ghost mini" onclick="job('fresh','${k}')">Проверить свежие</button>`
-      +`<button class="ghost mini" onclick="job('screen','${k}')">Пере-скрин</button></div>`;
-    if((t.top_fit||[]).length){h+='<div style="margin-top:10px">';
+      +`<div class="big" style="margin:8px 0">${(c.FIT||0)} <span class="muted" style="font-size:13px">подходящих (FIT)</span></div>`
+      +`<div class="row" style="gap:6px;margin:0 0 8px"><span class="pill FIT">FIT ${c.FIT??0}</span><span class="pill MAYBE">MAYBE ${c.MAYBE??0}</span><span class="pill SKIP">SKIP ${c.SKIP??0}</span>${c.ERROR?`<span class="pill ERROR">ERR ${c.ERROR}</span>`:""}</div>`
+      +(t.reviewed?'<div class="badge fresh" style="margin:0 0 8px">профиль проверен — реальные отклики разрешены</div>':'<div class="badge" style="margin:0 0 8px;color:var(--warn)">профиль не проверен → реальные отклики заблокированы</div>')
+      +`<div class="row" style="margin:0"><button class="mini" onclick="gotoVac('${k}','FIT')">Показать FIT →</button>`
+      +`<button class="ghost mini" onclick="gotoApply('${k}')">Откликнуться</button>`
+      +`<button class="ghost mini" onclick="job('fresh','${k}')">Проверить свежие</button></div>`;
+    if((t.top_fit||[]).length){h+='<div style="margin-top:12px">';
       for(const f of t.top_fit){h+=`<div class="tf"><div><a href="${f.url}" target="_blank">${esc(f.name)}</a>`
         +(f.fresh?'<span class="badge fresh">свежая</span>':"")+`<div class="muted">${esc(f.company||"")} · ${esc(f.exp_label||"")}</div></div>`
         +`<div style="text-align:right;white-space:nowrap"><span class="pill FIT">${f.fit_score}</span><br>`
@@ -1052,147 +1276,217 @@ async function loadOverview(){const d=await api("/api/overview");
       h+='</div>';}
     h+='</div>';}
   h+='</div>';
-  h+='<div class="card" style="margin-top:12px"><h3>Автопоиск свежих вакансий</h3>'
-    +'<p class="muted" style="margin:0 0 8px">«Проверить свежие» = скан за последние дни + скрининг для трека (отклики остаются ручными). Для автоматики есть таймер systemd / cron — см. packaging/README.</p>'
-    +'<div class="row"><button class="ghost mini" onclick="job(\\'fresh\\',\\'ai\\')">Свежие: AI</button>'
-    +'<button class="ghost mini" onclick="job(\\'fresh\\',\\'infra\\')">Свежие: DevOps</button></div>'
-    +(d.watch_tail?`<pre style="margin-top:8px;max-height:120px">${esc(d.watch_tail)}</pre>`:'<div class="muted" style="margin-top:6px">лог автопоиска пуст (таймер ещё не запускался)</div>')
-    +'</div>';
-  h+='<div class="card" style="margin-top:12px"><h3>Прочие действия</h3><div class="row">'
-    +btn("scan","ai","Scan AI")+btn("scan","infra","Scan DevOps")
-    +btn("sync","ai","Sync отклики")+btn("analytics","ai","Analytics")+'</div></div>';
+  h+='<div class="card" style="margin-top:12px"><h3>Прочие действия</h3><div class="row" style="margin:0">'
+    +btn("scan","ai","Сканировать AI")+btn("scan","infra","Сканировать DevOps")
+    +btn("sync","ai","Синхронизировать статусы с HH")+btn("analytics","ai","Пересчитать аналитику")+'</div></div>';
   $("#overview").innerHTML=h;
   $("#hbal").innerHTML=d.balance!=null?`баланс <b>${rub(d.balance)} ₽</b>`:"";}
-function card(t,b,sub){return `<div class="card"><h3>${t}</h3><div class="big">${b}</div>${sub?`<div class="muted">${sub}</div>`:""}</div>`;}
+function card(t,b,sub){return `<div class="card"><h3>${t}</h3><div class="big">${b}</div>${sub?`<div class="sub">${sub}</div>`:""}</div>`;}
 function btn(a,tr,l){return `<button class="ghost mini" onclick="job('${a}','${tr}')">${l}</button>`;}
-function gotoVac(track,filter){$("#vtrack").value=track;$("#vfilter").value=filter;
-  if(filter==="SKIP")$("#vshowskip").checked=true;show("vac");}
+function gotoVac(track,filter){if(track)$("#vtrack").value=track;VFILTER=filter;show("vac");}
+function gotoApply(track){pendingApplyTrack=track;show("apply");}
 
 /* ---- jobs ---- */
-async function job(action,track){const body={action,track:track||$("#atrack")?.value||"ai"};
-  if(action.startsWith("apply")){body.track=$("#atrack").value;body.limit=+$("#alimit").value;
-    if($("#atarget").value)body.target=+$("#atarget").value;if(action==="apply_run")body.confirm=$("#aconfirm").checked;}
+async function job(action,track){const body={action,track:track||"ai"};
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
 
-/* ---- settings ---- */
-function fillTrackSelects(tracks){TRACKS=tracks||[];
-  for(const id of ["#vtrack","#atrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
-    sel.innerHTML=TRACKS.map(t=>`<option value="${t.key}">${esc(t.label)}</option>`).join("");
-    if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
-  const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
-async function loadSettings(){const s=await api("/api/settings");
-  fillTrackSelects(s.tracks);
-  const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
-  $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";
-  $("#sconstraints").value=s.constraints||"";$("#ssalary").value=s.salary_expectation||"";
-  const cr=s.criteria||{};
-  $("#scrit").innerHTML=(s.tracks||[]).map(t=>`<div class="row" style="margin-bottom:2px"><label style="width:170px">${esc(t.label)} <span class="muted">(${t.type})</span></label></div>`
-    +`<textarea data-crit="${t.key}" rows="3" style="width:100%">${esc(cr[t.key]||"")}</textarea>`).join("")
-    ||'<span class="muted">нет треков</span>';}
-async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value,
-  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value};
-  document.querySelectorAll("#scrit textarea[data-crit]").forEach(t=>{body["criteria_"+t.dataset.crit]=t.value;});
-  const k=$("#skey").value.trim();if(k)body.api_key=k;
-  const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено";}
+/* ---- vacancies ---- */
+async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
+  const onlyFresh=$("#vfresh").checked,onlyMarked=$("#vmarked").checked,mk=marks();
+  const d=await api("/api/vacancies?track="+tr);
+  const all=d.rows||[];
+  const cnt={FIT:0,MAYBE:0,SKIP:0};all.forEach(r=>cnt[r.verdict]=(cnt[r.verdict]||0)+1);
+  $("#vseg").innerHTML=[["","все",all.length],["FIT","FIT",cnt.FIT||0],["MAYBE","MAYBE",cnt.MAYBE||0],["SKIP","SKIP",cnt.SKIP||0]]
+    .map(([v,l,n])=>`<button class="${VFILTER===v?"on":""}" onclick="VFILTER='${v}';loadVac()">${l} ${n}</button>`).join("");
+  let rows=all.filter(r=> VFILTER? r.verdict===VFILTER : r.verdict!=="SKIP");
+  if(onlyFresh)rows=rows.filter(r=>r.fresh);
+  if(onlyMarked)rows=rows.filter(r=>mk.has(String(r.id)));
+  const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
+  $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length}${dup}`;
+  let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
+  for(const r of rows){const id=String(r.id);const on=mk.has(id);
+    const expc=r.over_experience?' class="hl nowrap"':' class="nowrap"';
+    const badges=(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"")+(r.applied?'<span class="badge applied">откликнулся</span>':"");
+    const status=r.blocked?'<span class="muted">откликался</span>':(r.applied?'<span class="muted">отмечен</span>':esc(r.db_status||""));
+    h+=`<tr><td><span class="star ${on?"on":""}" onclick="toggleMark('${id}')">${on?"★":"☆"}</span></td>
+      <td><span class="pill ${r.verdict}">${r.verdict||"?"}</span></td>
+      <td class="nowrap">${r.fit_score??""}</td>
+      <td${expc} title="${r.over_experience?'требуемый опыт выше твоего':''}">${esc(r.exp_label||"—")}</td>
+      <td class="muted nowrap">${esc(r.salary_label||"—")}</td>
+      <td><a href="${r.url}" target="_blank">${esc(r.name)}</a>${badges}<div class="muted">${esc(r.company||"")}</div></td>
+      <td class="reason">${esc(r.reason||"")}</td>
+      <td class="nowrap">${status}</td>
+      <td><button class="ghost mini" onclick="genLetter('${tr}','${id}','${encodeURIComponent(r.url||"")}')">Письмо</button></td></tr>`;}
+  $("#vtable").innerHTML=h+"</table>";}
+["vtrack","vfresh","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
 
-/* ---- resumes & tracks ---- */
-async function loadTracks(refresh){$("#tracksmeta").innerHTML=refresh?'<span class="spin"></span> читаю резюме с HH…':$("#tracksmeta").innerHTML;
-  const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
-  fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label,type:t.type})));
-  let h='<table><tr><th>Трек</th><th>Рубрика</th><th>Резюме на HH</th><th>Статус</th><th>Файлы</th></tr>';
-  for(const t of (d.tracks||[])){let st;
-    if(t.resume_present===true)st='<span class="pill FIT">на HH ✓</span>';
-    else if(t.resume_present===false)st='<span class="pill SKIP">нет на HH</span>';
-    else st='<span class="muted">резюме не указано</span>';
-    h+=`<tr><td><b>${esc(t.label)}</b><div class="muted">${t.key}</div></td><td>${t.type}</td>
-      <td>${esc(t.resume||"—")}</td><td>${st}</td>
-      <td class="muted" style="font-size:12px">${esc(t.profile)}<br>${esc(t.search)}</td></tr>`;}
-  $("#trackstable").innerHTML=h+"</table>";
-  const err=d.error?`<div class="hl" style="margin-top:8px">${esc(d.error)}</div>`:"";
-  const un=(d.unassigned_resumes||[]);
-  $("#unassigned").innerHTML=err+(un.length?`<div style="margin-top:10px" class="muted">Резюме на HH без трека: `+un.map(esc).join(", ")+`. Заведи под них трек ниже.</div>`
-    :(d.auth_status==="confirmed"?'<div class="muted" style="margin-top:10px">Все активные резюме HH привязаны к трекам.</div>':""));
-  $("#tracksmeta").textContent="Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (~10с).";}
-async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").value,type:$("#ttype").value,
-  resume:$("#tresume").value,queries:$("#tqueries").value,criteria:$("#tcriteria").value};
-  $("#tmsg").innerHTML='<span class="spin"></span> создаю…';
-  const r=await api("/api/track",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(r.error){$("#tmsg").textContent="Ошибка: "+r.error;return;}
-  $("#tmsg").textContent="Готово: "+r.profile+" — "+(r.note||"");
-  $("#tkey").value=$("#tlabel").value=$("#tresume").value=$("#tqueries").value=$("#tcriteria").value="";
-  loadTracks(false);}
+/* ---- apply queue ---- */
+let pendingApplyTrack=null,applyMode="all";
+async function loadApply(){const sec=$("#apply");
+  const track=pendingApplyTrack||($("#atrack")&&$("#atrack").value)||(TRACKS[0]&&TRACKS[0].key)||"ai";pendingApplyTrack=null;
+  sec.innerHTML=`<div class="card"><div class="row" style="margin:0">
+    <label>Трек</label><select id="atrack"></select>
+    <span class="seg" id="aseg"></span>
+    <label>Лимит</label><input id="alimit" type="number" value="10" style="width:74px">
+    <button class="ghost mini" onclick="loadApply()">Обновить</button></div>
+    <div id="asummary" class="row" style="margin-top:10px"></div>
+    <div class="tablewrap"><div id="aqueue"></div></div>
+    <div class="row" style="margin-top:12px"><button class="ghost" onclick="runApply('apply_dry')">Пробный запуск (ничего не отправит)</button></div>
+    <div id="areal"></div>
+  </div>`;
+  $("#atrack").innerHTML=TRACKS.map(t=>`<option value="${t.key}">${esc(t.label)}</option>`).join("");
+  $("#atrack").value=track;$("#alimit").value=lastLimit;
+  $("#atrack").onchange=loadApply;$("#alimit").onchange=refreshQueue;
+  $("#aseg").innerHTML=[["all","все accepted"],["fit","только FIT"],["marked","только ★"]]
+    .map(([m,l])=>`<button class="${applyMode===m?"on":""}" onclick="applyMode='${m}';refreshQueue()">${l}</button>`).join("");
+  refreshQueue();}
+let lastLimit=10;
+async function refreshQueue(){const track=$("#atrack").value;lastLimit=+$("#alimit").value||10;
+  const body={track,mode:applyMode,limit:lastLimit,marked:[...marks()]};
+  const d=await api("/api/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const willSend=d.will_send||0;
+  $("#asummary").innerHTML=`<span class="chip">Отправим <b>${willSend}</b> из ${d.sendable} готовых</span>`
+    +`<span class="chip">в очереди ${d.total}</span>`
+    +(d.reviewed?'<span class="chip" style="color:var(--fit)">профиль проверен</span>':'<span class="chip" style="color:var(--warn)">профиль не проверен — реальная отправка заблокирована</span>');
+  let h='<table><tr><th>#</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th class="nowrap">Статус</th><th></th></tr>';
+  let n=0;
+  for(const r of (d.rows||[])){const skip=r.blocked||r.applied;if(!skip)n++;
+    const willrow=(!skip&&n<=willSend);
+    const st=r.blocked?'откликался':(r.applied?'отмечен':(willrow?'в отправке':'ждёт'));
+    h+=`<tr class="qrow ${willrow?'send':''}"><td>${skip?'—':n}</td>
+      <td><span class="pill ${r.verdict}">${r.verdict}</span></td><td class="nowrap">${r.fit_score??''}</td>
+      <td class="nowrap ${r.over_experience?'hl':''}">${esc(r.exp_label||'—')}</td>
+      <td class="muted nowrap">${esc(r.salary_label||'—')}</td>
+      <td><a href="${r.url}" target="_blank">${esc(r.name)}</a><div class="muted">${esc(r.company||'')}</div></td>
+      <td class="nowrap muted">${st}</td>
+      <td><button class="ghost mini" onclick="genLetter('${track}','${r.id}','${encodeURIComponent(r.url||'')}')">Письмо</button></td></tr>`;}
+  $("#aqueue").innerHTML=h+"</table>";
+  $("#areal").innerHTML=d.reviewed?
+    `<hr style="border-color:var(--line)"><div class="row"><input type="checkbox" id="aconfirm"><label for="aconfirm">Подтверждаю реальную отправку ${willSend} откликов работодателям</label></div>
+     <div class="row"><button class="danger" onclick="runApply('apply_run')">Отправить реальные отклики</button></div>`
+    :`<p class="muted">Реальная отправка заблокирована: в профиле трека <code>reviewed = false</code>. Проверь отобранное пробным запуском; включение реальной отправки — отдельный осознанный шаг.</p>`;}
+async function runApply(action){const track=$("#atrack").value;
+  const body={action,track,mode:applyMode,limit:+$("#alimit").value||10,marked:[...marks()]};
+  if(action==="apply_run"){if(!$("#aconfirm")||!$("#aconfirm").checked){alert("Отметь галку подтверждения");return;}body.confirm=true;}
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
 
 /* ---- stats ---- */
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
   $("#spendcards").innerHTML=card("Баланс, ₽",rub(sp.balance),sp.balance_live?"aitunnel (live)":"из леджера")
     +card("Сегодня, ₽",sp.today_rub??0)+card("Всего потрачено, ₽",sp.total_rub??0)+card("Запросов к LLM",sp.calls??0);
   const days=sp.by_day||[];const mx=Math.max(1,...days.map(d=>d.rub));
-  $("#spendbars").innerHTML=days.map(d=>bar(d.date,d.rub,mx,'var(--accent)','₽')).join("")||'<span class="muted">нет данных (скрининг ещё не тратил или брал из кэша)</span>';
+  $("#spendbars").innerHTML=days.map(d=>bar(d.date,d.rub,mx,'var(--accent)','₽')).join("")||'<span class="muted">нет данных</span>';
   let vh="";const vd=s.verdicts||{};for(const k in vd){const t=vd[k],c=t.counts;
     if(!c){vh+=`<div class="muted" style="margin:8px 0">${t.label}: нет отчёта</div>`;continue;}
     const tot=Math.max(1,(c.FIT||0)+(c.MAYBE||0)+(c.SKIP||0)+(c.ERROR||0));
     vh+=`<div style="margin:10px 0"><b>${t.label}</b>`+seg('FIT',c.FIT||0,tot,'var(--fit)')+seg('MAYBE',c.MAYBE||0,tot,'var(--maybe)')+seg('SKIP',c.SKIP||0,tot,'var(--skip)')+seg('ERROR',c.ERROR||0,tot,'var(--mut)')+`</div>`;}
   $("#verdictbars").innerHTML=vh;}
-function bar(label,val,mx,color,unit){const w=Math.round(100*val/mx);return `<div class="row" style="gap:8px"><span class="muted" style="width:96px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:70px;text-align:right">${val}${unit||''}</span></div>`;}
-function seg(label,val,tot,color){const w=Math.round(100*val/tot);return `<div class="row" style="gap:8px"><span class="muted" style="width:70px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:40px;text-align:right">${val}</span></div>`;}
+function bar(label,val,mx,color,unit){const w=Math.round(100*val/mx);return `<div class="row" style="gap:8px"><span class="muted" style="width:110px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:80px;text-align:right">${val}${unit||''}</span></div>`;}
+function seg(label,val,tot,color){const w=Math.round(100*val/tot);return `<div class="row" style="gap:8px"><span class="muted" style="width:72px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:44px;text-align:right">${val}</span></div>`;}
 
 /* ---- job log ---- */
-async function refreshJob(){const j=await api("/api/job");
-  $("#logbox").textContent=(j.lines||[]).join("\\n")||"—";
-  const st=j.label?(j.label+(j.running?' <span class="spin"></span> идёт':(" ✓ код "+j.returncode))):"";
-  $("#jobstate").innerHTML=st;return !!j.running;}
+async function refreshJob(){const j=await api("/api/job");const has=!!j.label;
+  $("#logbox").textContent=(j.lines||[]).join("\\n")||(has?"":"Задач ещё не запускалось. Лог появится после «Проверить свежие», «Пересканировать», пробного запуска или отклика.");
+  $("#logmeta").innerHTML=has?(j.label+(j.running?' <span class="spin"></span> идёт':(" — завершено, код "+j.returncode))):'<span class="muted">нет активных задач</span>';
+  $("#logstop").disabled=!j.running;$("#logrefresh").disabled=!has;
+  const st=has?(j.label+(j.running?' ▶':' ✓')):"";$("#jobstate").textContent=st;
+  if(j.running){const b=$("#logbox");b.scrollTop=b.scrollHeight;}
+  return !!j.running;}
 async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
 
-/* ---- vacancies ---- */
-async function loadVac(){const tr=$("#vtrack").value,f=$("#vfilter").value,showskip=$("#vshowskip").checked;
-  const onlyFresh=$("#vfresh").checked,onlyMarked=$("#vmarked").checked,mk=marks();
-  const d=await api("/api/vacancies?track="+tr);
-  let rows=(d.rows||[]).filter(r=> f ? r.verdict===f : (showskip || r.verdict!=="SKIP"));
-  if(onlyFresh)rows=rows.filter(r=>r.fresh);
-  if(onlyMarked)rows=rows.filter(r=>mk.has(String(r.id)));
-  const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
-  $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length} из ${d.count||0}${dup}`;
-  let h='<table><tr><th>★</th><th>Вердикт</th><th>fit</th><th>Опыт</th><th>Зарплата</th><th>Вакансия</th><th>Причина</th><th>Статус</th><th></th></tr>';
-  for(const r of rows){const id=String(r.id);const on=mk.has(id);
-    const expc=r.over_experience?' class="hl"':"";
-    const dupb=r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"";
-    const freshb=r.fresh?'<span class="badge fresh">свежая</span>':"";
-    h+=`<tr><td><span class="star ${on?"on":""}" onclick="toggleMark('${id}')">${on?"★":"☆"}</span></td>
-      <td><span class="pill ${r.verdict}">${r.verdict||"?"}</span></td>
-      <td>${r.fit_score??""}</td>
-      <td${expc}>${esc(r.exp_label||"—")}</td>
-      <td class="muted">${esc(r.salary_label||"—")}</td>
-      <td><a href="${r.url}" target="_blank">${esc(r.name)}</a>${freshb}${dupb}<div class="muted">${esc(r.company||"")}</div></td>
-      <td class="muted">${esc(r.reason||"")}</td>
-      <td>${r.blocked?'<span class="muted">откликался</span>':esc(r.db_status||"")}</td>
-      <td><button class="ghost mini" onclick="genLetter('${tr}','${id}','${encodeURIComponent(r.url||"")}')">Письмо</button></td></tr>`;}
-  $("#vtable").innerHTML=h+"</table>";}
-["vtrack","vfilter","vshowskip","vfresh","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
+/* ---- tracks + watch ---- */
+async function loadTracks(refresh){if(refresh)$("#tracksmeta").innerHTML='<span class="spin"></span> читаю резюме с HH…';
+  const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
+  fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label})));
+  const checked=d.auth_status==="confirmed";
+  let h='<table><tr><th>Трек</th><th>Рубрика</th><th>Резюме на HH</th><th class="nowrap">Статус</th><th>Файлы</th></tr>';
+  for(const t of (d.tracks||[])){let st;
+    if(!checked)st='<span class="badge">не проверено</span>';
+    else if(t.resume_present===true)st='<span class="pill FIT">на HH ✓</span>';
+    else if(t.resume_present===false)st='<span class="pill SKIP">нет на HH</span>';
+    else st='<span class="muted">резюме не указано</span>';
+    h+=`<tr><td><b>${esc(t.label)}</b><div class="muted">${t.key}</div></td><td>${t.type}</td>
+      <td>${esc(t.resume||"—")}</td><td class="nowrap">${st}</td>
+      <td class="muted" style="font-size:12px">${esc(t.profile)}<br>${esc(t.search)}</td></tr>`;}
+  $("#trackstable").innerHTML=h+"</table>";
+  const un=(d.unassigned_resumes||[]);
+  $("#unassigned").innerHTML=(d.error?`<div class="hl" style="margin-top:8px">${esc(d.error)}</div>`:"")
+    +(un.length?`<div style="margin-top:10px" class="muted">Резюме на HH без трека: ${un.map(esc).join(", ")}. Заведи под них трек ниже.</div>`
+    :(checked?'<div class="muted" style="margin-top:10px">Все активные резюме HH привязаны к трекам.</div>':""));
+  $("#tracksmeta").textContent="Число треков задаётся в private/config/tracks.toml. «Обновить с HH» читает активные резюме через сессию (~10с).";
+  loadWatch();}
+async function loadWatch(){const w=await api("/api/watch");
+  if(!w.systemctl){$("#watchbox").innerHTML='<span class="hl">systemctl недоступен — используй cron (см. packaging/README).</span>';return;}
+  const active=w.active==="active";
+  let h=`<div class="row" style="margin:0">
+    <span class="chip">${w.installed?(active?'<b style="color:var(--fit)">включён</b>':'установлен, выключен'):'не установлен'}</span>
+    <label>Интервал, мин</label><input id="winterval" type="number" value="${w.interval_min||60}" style="width:80px">`;
+  if(!w.installed||!active)h+=`<button class="mini" onclick="watchCtl('install')">Установить и включить</button>`;
+  else h+=`<button class="ghost mini" onclick="watchCtl('interval')">Применить интервал</button><button class="danger mini" onclick="watchCtl('disable')">Выключить</button>`;
+  h+=`</div>`;
+  if(w.next)h+=`<div class="muted" style="margin-top:6px">следующий запуск: ${esc(w.next)}</div>`;
+  h+=w.log_tail?`<pre style="margin-top:8px;max-height:140px">${esc(w.log_tail)}</pre>`:'<div class="muted" style="margin-top:6px">лог автопоиска пуст</div>';
+  $("#watchbox").innerHTML=h;}
+async function watchCtl(action){const mins=+($("#winterval")&&$("#winterval").value)||60;
+  $("#watchbox").innerHTML='<span class="spin"></span> применяю…';
+  const r=await api("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,minutes:mins})});
+  if(r.error)alert("Ошибка: "+r.error);loadWatch();}
+
+/* ---- settings ---- */
+async function loadSettings(){const s=await api("/api/settings");fillTrackSelects(s.tracks);
+  const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
+  $("#sbase").value=s.base_url||"";
+  $("#sstatus").innerHTML=`Ключ: ${s.key_set?'<b style="color:var(--fit)">задан ✓</b>':'<span class="hl">не задан</span>'}<br>Модель: ${esc(s.model)}<br>Треков: ${(s.tracks||[]).length}`;
+  $("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";
+  $("#sconstraints").value=s.constraints||"";$("#ssalary").value=s.salary_expectation||"";
+  const cr=s.criteria||{};
+  $("#scrit").innerHTML=(s.tracks||[]).map(t=>`<div class="field"><label>${esc(t.label)} <span class="muted">(${t.type})</span></label><textarea data-crit="${t.key}" style="min-height:150px">${esc(cr[t.key]||"")}</textarea></div>`).join("")||'<span class="muted">нет треков</span>';}
+async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value,
+  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value};
+  document.querySelectorAll("#scrit textarea[data-crit]").forEach(t=>{body["criteria_"+t.dataset.crit]=t.value;});
+  const k=$("#skey").value.trim();if(k)body.api_key=k;
+  const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено ✓";loadSettings();}
+
+/* ---- add track ---- */
+async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").value,type:$("#ttype").value,
+  resume:$("#tresume").value,queries:$("#tqueries").value,criteria:$("#tcriteria").value};
+  $("#tmsg").innerHTML='<span class="spin"></span> создаю…';
+  const r=await api("/api/track",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.error){$("#tmsg").textContent="Ошибка: "+r.error;return;}
+  $("#tmsg").textContent="Готово: "+r.profile+" — "+(r.note||"");
+  $("#tkey").value=$("#tlabel").value=$("#tresume").value=$("#tqueries").value=$("#tcriteria").value="";loadTracks(false);}
 
 /* ---- letter modal ---- */
+let modalCtx={track:"",id:""};
 function closeModal(){$("#modal").classList.add("hide");}
 function openHH(){const u=$("#modal").dataset.url;if(u)window.open(u,"_blank");}
-function copyLetter(){const t=$("#lettertext").value;if(navigator.clipboard)navigator.clipboard.writeText(t);$("#letterhint").textContent="скопировано";}
-async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("hide");
+function copyLetter(){const t=$("#lettertext").value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(()=>$("#letterhint").textContent="скопировано ✓").catch(()=>$("#letterhint").textContent="не удалось скопировать");}
+function copyAndOpen(){copyLetter();openHH();}
+async function markApplied(){if(!modalCtx.id)return;
+  await api("/api/applied",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:modalCtx.id,on:true})});
+  $("#letterhint").textContent="отмечено: откликнулся ✓";}
+async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("hide");modalCtx={track,id};
   m.dataset.url=decodeURIComponent(url||"");
-  $("#lettertitle").textContent="";$("#letterhint").innerHTML='<span class="spin"></span> генерирую…';
-  $("#lettertext").value="";
+  $("#lettertitle").textContent="Сопроводительное письмо";$("#lettersub").textContent="";
+  $("#letterhint").innerHTML='<span class="spin"></span> генерирую…';$("#lettertext").value="";
   const r=await api("/api/letter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({track,id})});
   if(r.error){$("#letterhint").textContent="";$("#lettertext").value="Ошибка: "+r.error;return;}
-  $("#lettertitle").textContent=r.name||"";$("#lettertext").value=r.text||"";
+  $("#lettersub").textContent=r.name||"";$("#lettertext").value=r.text||"";
   if(!m.dataset.url&&r.url)m.dataset.url=r.url;
-  try{await navigator.clipboard.writeText(r.text||"");$("#letterhint").textContent="письмо скопировано в буфер";}
-  catch(e){$("#letterhint").textContent="скопируй письмо кнопкой (буфер недоступен)";}}
+  const ta=$("#lettertext");ta.style.height="auto";ta.style.height=Math.min(500,ta.scrollHeight+8)+"px";
+  $("#letterhint").textContent="готово — проверь и нажми «Копировать и открыть на HH»";}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});
 
-/* ---- live refresh ---- */
+/* ---- boot ---- */
 let prevRunning=false;
 setInterval(async()=>{const running=await refreshJob();
-  if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
+  if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();if(tab==="apply")refreshQueue();}
   prevRunning=running;},3000);
-async function init(){try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}loadOverview();}
+async function init(){setHdr();try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}
+  const h=(location.hash||"").replace("#","");show(SECTIONS.includes(h)?h:"overview");}
 init();
 </script>
 </body></html>"""
