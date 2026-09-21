@@ -29,7 +29,7 @@ from .config import professional_context
 SCREEN_PROMPT_VERSION = "2"
 DEFAULT_MODEL = "deepseek-v4-flash-0731"
 DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
-DEFAULT_CONCURRENCY = 3  # aitunnel throttles hard; keep concurrency low
+DEFAULT_CONCURRENCY = 2  # aitunnel throttles hard; keep concurrency low
 VERDICTS = ("FIT", "MAYBE", "SKIP")
 
 # Track-specific guidance appended to the shared rubric.  Kept as data so a
@@ -187,14 +187,16 @@ def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
     import httpx
 
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 600}
+    # Reasoning models spend tokens on hidden reasoning before the JSON, so give
+    # generous headroom; too small a budget returns an empty message.
+    payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 1600}
     last_error: Exception | None = None
     for attempt in range(max_retries):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         try:
-            response = post(url, json=payload, headers=headers, timeout=max(1.0, min(45.0, remaining)))
+            response = post(url, json=payload, headers=headers, timeout=max(1.0, min(90.0, remaining)))
             status = getattr(response, "status_code", 200)
             if status in RETRY_STATUS:
                 last_error = ScreenError(f"HTTP {status}: rate limited or unavailable")
@@ -216,7 +218,7 @@ def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
 def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache_dir: Path, *,
                      model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
                      track: str = "general", concurrency: int = DEFAULT_CONCURRENCY,
-                     per_item_deadline: float = 60.0, api_key: str | None = None,
+                     per_item_deadline: float = 150.0, api_key: str | None = None,
                      post: Callable[..., Any] | None = None,
                      on_result: Callable[[dict[str, Any], int, int], None] | None = None,
                      ) -> list[dict[str, Any]]:
@@ -241,7 +243,7 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
     import httpx
 
     owns_client = post is None
-    client = httpx.Client(timeout=httpx.Timeout(10.0, read=45.0)) if owns_client else None
+    client = httpx.Client(timeout=httpx.Timeout(10.0, read=90.0)) if owns_client else None
     do_post = client.post if client is not None else post
 
     def run(item: dict[str, Any]) -> dict[str, Any]:
@@ -260,7 +262,9 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
             verdict = _post_verdict(do_post, base_url, model, key, messages,
                                     time.monotonic() + per_item_deadline)
         except ScreenError as exc:
-            return {**base, "verdict": "MAYBE", "fit_score": 0,
+            # A transport/parse failure is NOT a real verdict: mark ERROR so it is
+            # never accepted for applying and gets retried on the next run.
+            return {**base, "verdict": "ERROR", "fit_score": 0,
                     "reason": f"скрининг недоступен: {str(exc)[:120]}", "source": "error"}
         path.write_text(json.dumps(verdict, ensure_ascii=False), encoding="utf-8")
         return {**base, **verdict, "source": "generated"}

@@ -634,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def _counts(rows: list[dict]) -> dict[str, int]:
             return {verdict: sum(1 for row in rows if row.get("verdict") == verdict)
-                    for verdict in ("FIT", "MAYBE", "SKIP")}
+                    for verdict in ("FIT", "MAYBE", "SKIP", "ERROR")}
 
         streamed: list[dict] = []
 
@@ -661,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
                                           "counts": counts, "results": results})
         accepted = {"FIT"} if args.accept == "fit" else {"FIT", "MAYBE"}
         accepted_ids = [row["id"] for row in results if row.get("verdict") in accepted]
-        for verdict in ("FIT", "MAYBE", "SKIP"):
+        for verdict in ("FIT", "MAYBE", "SKIP", "ERROR"):
             print(f"{verdict}: {counts[verdict]}")
         print(f"screened: {len(results)}; model={model}; track={args.track}")
         print(f"screen_report: {report_path}")

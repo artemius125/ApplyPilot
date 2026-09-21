@@ -13,6 +13,7 @@ explicit confirm and ``reviewed = true`` in the profile.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -47,6 +48,18 @@ TRACKS = {
 }
 
 
+# Model choices offered in the admin (the first is the stock default).
+MODEL_CHOICES = [
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5",
+    "deepseek-v4-flash-0731",
+    "qwen3-7-flash",
+]
+DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
+
+
 @dataclass
 class Job:
     """A single background subprocess whose output is streamed to the browser."""
@@ -79,15 +92,16 @@ class JobRunner:
         self.lock = threading.Lock()
         self.current: Job | None = None
 
-    def start(self, argv: list[str], label: str) -> tuple[bool, str]:
+    def start(self, argv: list[str], label: str, env: dict[str, str] | None = None) -> tuple[bool, str]:
         with self.lock:
             if self.current is not None and self.current.returncode is None:
                 return False, "another job is running"
             job = Job(argv=argv, label=label, started_at=time.time())
+            run_env = {**os.environ, **(env or {})}
             try:
                 job.process = subprocess.Popen(
                     argv, cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
+                    text=True, bufsize=1, env=run_env,
                 )
             except OSError as exc:
                 return False, f"failed to start: {exc}"
@@ -135,6 +149,44 @@ class AdminApp:
         self.config = config
         self.root = config.root
         self.runner = JobRunner(self.root)
+        self.settings_path = config.data_dir / "admin-settings.json"
+
+    # ---- settings (model + per-user API key) ---------------------------
+    def load_settings(self) -> dict[str, Any]:
+        data = _read_json(self.settings_path) or {}
+        return data if isinstance(data, dict) else {}
+
+    def settings_public(self) -> dict[str, Any]:
+        """Settings for the browser — the API key is NEVER returned, only whether it is set."""
+        s = self.load_settings()
+        return {
+            "model": s.get("model") or DEFAULT_MODEL,
+            "base_url": s.get("base_url") or DEFAULT_BASE_URL,
+            "key_set": bool(s.get("api_key") or os.getenv("AITUNNEL_API_KEY")),
+            "models": MODEL_CHOICES,
+        }
+
+    def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
+        s = self.load_settings()
+        if patch.get("model"):
+            s["model"] = str(patch["model"]).strip()
+        if patch.get("base_url"):
+            s["base_url"] = str(patch["base_url"]).strip()
+        # Only overwrite the key when a non-empty value is supplied; "" leaves it as is.
+        api_key = patch.get("api_key")
+        if isinstance(api_key, str) and api_key.strip():
+            s["api_key"] = api_key.strip()
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8")
+        try:
+            self.settings_path.chmod(0o600)
+        except OSError:
+            pass
+        return self.settings_public()
+
+    def _screen_env(self) -> dict[str, str]:
+        key = str(self.load_settings().get("api_key") or "").strip()
+        return {"AITUNNEL_API_KEY": key} if key else {}
 
     # ---- data endpoints -------------------------------------------------
     def overview(self) -> dict[str, Any]:
@@ -196,6 +248,11 @@ class AdminApp:
                 "--track", track,
                 "--output", cfg["screen_report"], "--emit-snapshot", cfg["accepted"],
             ]
+            model = str(self.load_settings().get("model") or "").strip()
+            if model:
+                argv += ["--model", model]
+            if not self._screen_env() and not os.getenv("AITUNNEL_API_KEY"):
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
         elif action == "analytics":
             argv = base + ["analytics"]
         elif action in {"apply_dry", "apply_run"}:
@@ -217,7 +274,7 @@ class AdminApp:
                     argv += ["--target-success", str(int(body["target"]))]
         else:
             return False, f"unknown action: {action}"
-        return self.runner.start(argv, f"{action}:{track}")
+        return self.runner.start(argv, f"{action}:{track}", env=self._screen_env())
 
 
 def _track_queries(root: Path, track: str) -> set[str]:
@@ -267,6 +324,8 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.vacancies(track))
             elif parsed.path == "/api/job":
                 self._send(200, app.runner.status() or {})
+            elif parsed.path == "/api/settings":
+                self._send(200, app.settings_public())
             else:
                 self._send(404, {"error": "not found"})
 
@@ -279,6 +338,8 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200 if ok else 409, {"ok": ok, "message": message})
             elif parsed.path == "/api/stop":
                 self._send(200, {"ok": app.runner.stop()})
+            elif parsed.path == "/api/settings":
+                self._send(200, app.save_settings(body if isinstance(body, dict) else {}))
             else:
                 self._send(404, {"error": "not found"})
 
@@ -344,6 +405,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <div class="tab" data-t="vac">Вакансии</div>
 <div class="tab" data-t="apply">Отклики</div>
 <div class="tab" data-t="log">Лог</div>
+<div class="tab" data-t="settings">Настройки</div>
 </div>
 <span id="jobstate" class="muted" style="margin-left:auto"></span>
 </header>
@@ -373,14 +435,24 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
   </div>
 </section>
 <section id="log" class="hide"><div class="row"><button class="ghost" onclick="refreshJob()">Обновить</button><button class="danger" onclick="stopJob()">Стоп</button></div><pre id="logbox">—</pre></section>
+<section id="settings" class="hide">
+  <div class="card" style="max-width:640px">
+    <h3>Модель и ключ (LLM-скрининг)</h3>
+    <div class="row"><label>Модель</label><select id="smodel" style="min-width:220px"></select></div>
+    <div class="row"><label>Base URL</label><input id="sbase" style="min-width:340px"></div>
+    <div class="row"><label>API-ключ</label><input id="skey" type="password" placeholder="sk-aitunnel-... (оставь пустым — не менять)" style="min-width:340px"></div>
+    <div class="row"><button onclick="saveSettings()">Сохранить</button><span id="skeystate" class="muted"></span></div>
+    <p class="muted">Ключ хранится локально (права 600), в интерфейс не возвращается. У каждого пользователя — свой ключ.</p>
+  </div>
+</section>
 </main>
 <script>
 const $=s=>document.querySelector(s);
 let tab="overview";
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{tab=t.dataset.t;
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x===t));
-  ["overview","vac","apply","log"].forEach(id=>$("#"+id).classList.toggle("hide",id!==tab));
-  if(tab==="overview")loadOverview(); if(tab==="vac")loadVac();});
+  ["overview","vac","apply","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!==tab));
+  if(tab==="overview")loadOverview(); if(tab==="vac")loadVac(); if(tab==="settings")loadSettings();});
 async function api(p,opt){const r=await fetch(p,opt);return r.json();}
 async function loadOverview(){const d=await api("/api/overview");
   let h='<div class="grid">';
@@ -402,7 +474,13 @@ async function job(action,track){const body={action,track:track||$("#atrack")?.v
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;} tab="log";
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t==="log"));
-  ["overview","vac","apply","log"].forEach(id=>$("#"+id).classList.toggle("hide",id!=="log"));refreshJob();}
+  ["overview","vac","apply","log","settings"].forEach(id=>$("#"+id).classList.toggle("hide",id!=="log"));refreshJob();}
+async function loadSettings(){const s=await api("/api/settings");
+  const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
+  $("#sbase").value=s.base_url||"";$("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";}
+async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value};const k=$("#skey").value.trim();if(k)body.api_key=k;
+  const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено";}
 async function refreshJob(){const j=await api("/api/job");
   $("#logbox").textContent=(j.lines||[]).join("\\n")||"—";
   $("#jobstate").textContent=j.label?(j.label+(j.running?" ▶ идёт":(" ✓ код "+j.returncode))):"";
