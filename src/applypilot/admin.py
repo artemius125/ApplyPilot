@@ -818,6 +818,53 @@ class AdminApp:
         path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
         return {"ok": True, "bad": len(s), "on": on}
 
+    def export_bad(self) -> str:
+        """Dump all vacancies marked 'bad' as Markdown for manual prompt tuning."""
+        bad = self._bad()
+        if not bad:
+            return "# Плохие вакансии\n\nПока пусто — помечай неподходящие кнопкой «👎 плохая».\n"
+        # id -> full item (from every scan/accepted snapshot)
+        items: dict[str, dict[str, Any]] = {}
+        snap_dir = self.root / "private/data/snapshots"
+        for path in snap_dir.glob("*.json"):
+            data = _read_json(path)
+            if not isinstance(data, dict):
+                continue
+            lists = [data.get("items")] + [seg.get("items") for seg in data.get("segments", [])
+                                           if isinstance(seg, dict)]
+            for lst in lists:
+                if isinstance(lst, list):
+                    for it in lst:
+                        if isinstance(it, dict) and str(it.get("id", "")):
+                            items.setdefault(str(it["id"]), it)
+        # id -> screener verdict/reason/track
+        verdicts: dict[str, dict[str, Any]] = {}
+        for track, cfg in TRACKS.items():
+            report = _read_json(self.root / cfg["screen_report"]) or {}
+            for r in report.get("results", []) if isinstance(report, dict) else []:
+                verdicts.setdefault(str(r.get("id", "")), {**r, "track": track})
+        lines = [f"# Плохие вакансии ({len(bad)}) — для ручной донастройки промпта скрининга", "",
+                 ("Помечены оператором как «не то». Разбирай общие признаки и переноси их в "
+                  "правила скрининга (вкладка «Настройки»)."), ""]
+        for vid in sorted(bad):
+            it = items.get(vid, {})
+            v = verdicts.get(vid, {})
+            name = _disp(it.get("name") or v.get("name") or f"id {vid}")
+            company = _disp(it.get("company") or v.get("company") or "")
+            lines.append(f"## {name} — {company}".rstrip(" —"))
+            lines.append(f"- id: {vid}  ·  url: {it.get('url') or v.get('url') or ''}")
+            lines.append(f"- опыт (HH): {it.get('experience', '—')}  ·  зарплата: "
+                         f"{_salary_label(it.get('salary'))}  ·  формат: {it.get('schedule', '—')}")
+            if v:
+                lines.append(f"- вердикт скринера: {v.get('verdict', '?')} "
+                             f"fit={v.get('fit_score', '?')} — {_disp(v.get('reason', ''))}")
+            desc = _disp(it.get("description", "")).strip()
+            if desc:
+                lines.append("- описание:")
+                lines.append("  " + desc[:1500].replace("\n", "\n  "))
+            lines.append("")
+        return "\n".join(lines)
+
     # ---- apply queue (what a run will actually send to) ----------------
     def apply_queue(self, track: str, mode: str = "all", limit: int = 10,
                     marked: list[str] | None = None) -> dict[str, Any]:
@@ -1008,6 +1055,8 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.tracks_overview(refresh=refresh))
             elif parsed.path == "/api/watch":
                 self._send(200, app.watch_status())
+            elif parsed.path == "/api/bad-export":
+                self._send(200, app.export_bad().encode("utf-8"), "text/markdown")
             else:
                 self._send(404, {"error": "not found"})
 
@@ -1077,6 +1126,7 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
         print("\nstopping admin")
     finally:
         server.server_close()
+
 
 
 
@@ -1358,7 +1408,8 @@ async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
   if(onlyFresh)rows=rows.filter(r=>r.fresh);
   if(onlyMarked)rows=rows.filter(r=>mk.has(String(r.id)));
   const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
-  $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length}${dup}`;
+  const exportBtn=VSTATUS==="bad"?` <button class="ghost mini" onclick="exportBad()">Выгрузить в текст (.md)</button>`:"";
+  $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length}${dup}${exportBtn}`;
   let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
   for(const r of rows){const id=String(r.id);const on=mk.has(id);
     const expc=r.over_experience?' class="hl nowrap"':' class="nowrap"';
@@ -1380,6 +1431,10 @@ async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
 async function markViewed(id){try{await api("/api/viewed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});}catch(e){}
   setTimeout(loadVac,600);}
 async function markBad(id,on){await api("/api/bad",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,on})});loadVac();}
+async function exportBad(){const r=await fetch("/api/bad-export");const text=await r.text();
+  const blob=new Blob([text],{type:"text/markdown;charset=utf-8"});const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");a.href=url;a.download="bad-vacancies.md";document.body.appendChild(a);a.click();
+  a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);}
 ["vtrack","vfresh","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
 
 /* ---- apply queue ---- */
