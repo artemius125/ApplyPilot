@@ -11,7 +11,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import __version__
+from . import __version__, letters
 from .admin import serve as admin_serve
 from .analytics import report
 from .config import (
@@ -916,12 +916,26 @@ def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple
         return render_template(vacancy, prepared), "template"
     settings = prepared.get("cover_letter", {})
     fallback = render_template(vacancy, prepared) if settings.get("fallback_to_template", False) else None
-    llm = prepared.get("llm", {})
-    if not isinstance(llm, dict) or not isinstance(llm.get("model", ""), str):
-        raise ConfigError("llm.model must be a string")
+    provider = str(settings.get("provider", "openrouter") or "openrouter").strip()
+    if provider not in ("openrouter", "aitunnel"):
+        raise ConfigError("cover_letter.provider must be openrouter or aitunnel")
     try:
-        text, source = generate(vacancy, prepared, config.data_dir / "llm-cache",
-                                str(llm.get("model", "")), enabled=True, required=True)
+        if provider == "aitunnel":
+            # Same per-vacancy generator and prompt the admin UI uses (letters.py),
+            # so the letter that is sent is the one that was previewed.
+            screen = prepared.get("screen", {}) if isinstance(prepared.get("screen"), dict) else {}
+            model = str(settings.get("model") or screen.get("model") or letters.DEFAULT_MODEL).strip()
+            base_url = str(settings.get("base_url") or screen.get("base_url")
+                           or letters.DEFAULT_BASE_URL).strip()
+            result = letters.generate_letter(vacancy, prepared, config.data_dir / "letter-cache",
+                                             model=model, base_url=base_url)
+            text, source = str(result.get("text", "")), str(result.get("source", "generated"))
+        else:
+            llm = prepared.get("llm", {})
+            if not isinstance(llm, dict) or not isinstance(llm.get("model", ""), str):
+                raise ConfigError("llm.model must be a string")
+            text, source = generate(vacancy, prepared, config.data_dir / "llm-cache",
+                                    str(llm.get("model", "")), enabled=True, required=True)
         if not text.strip():
             raise RuntimeError("provider returned an empty cover letter")
         return text, source
