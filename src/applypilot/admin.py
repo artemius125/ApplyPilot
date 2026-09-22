@@ -153,9 +153,11 @@ class Job:
     returncode: int | None = None
     lines: list[str] = field(default_factory=list)
     process: subprocess.Popen | None = None
+    id: str = ""
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "label": self.label,
             "argv": self.argv,
             "running": self.process is not None and self.returncode is None,
@@ -166,19 +168,60 @@ class Job:
         }
 
 
-class JobRunner:
-    """Runs at most one job at a time and captures its output."""
+# How many finished runs are kept in the on-disk journal (and in memory).
+JOURNAL_KEEP = 60
+# Output lines stored per finished run in the journal (live view keeps more).
+JOURNAL_LINES = 500
 
-    def __init__(self, root: Path) -> None:
+
+class JobRunner:
+    """Runs at most one job at a time and keeps a journal of finished runs."""
+
+    def __init__(self, root: Path, journal_path: Path | None = None) -> None:
         self.root = root
         self.lock = threading.Lock()
         self.current: Job | None = None
+        self.journal_path = journal_path
+        # Finished runs, oldest first; seeded from disk so the journal survives
+        # restarts and each new job appends rather than overwriting.
+        self.runs: list[dict[str, Any]] = self._load_journal()
+
+    def _load_journal(self) -> list[dict[str, Any]]:
+        if not self.journal_path or not self.journal_path.exists():
+            return []
+        runs: list[dict[str, Any]] = []
+        try:
+            for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("id"):
+                    runs.append(row)
+        except OSError:
+            return []
+        return runs[-JOURNAL_KEEP:]
+
+    def _persist_journal(self) -> None:
+        if not self.journal_path:
+            return
+        try:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            body = "\n".join(json.dumps(row, ensure_ascii=False) for row in self.runs)
+            self.journal_path.write_text(body + ("\n" if body else ""), encoding="utf-8")
+        except OSError:
+            pass
 
     def start(self, argv: list[str], label: str, env: dict[str, str] | None = None) -> tuple[bool, str]:
         with self.lock:
             if self.current is not None and self.current.returncode is None:
                 return False, "another job is running"
-            job = Job(argv=argv, label=label, started_at=time.time())
+            started = time.time()
+            job = Job(argv=argv, label=label, started_at=started,
+                      id=f"{int(started * 1000)}-{label}")
             run_env = {**os.environ, **(env or {})}
             try:
                 job.process = subprocess.Popen(
@@ -198,9 +241,42 @@ class JobRunner:
         job.process.wait()
         job.returncode = job.process.returncode
         job.finished_at = time.time()
+        record = {
+            "id": job.id, "label": job.label, "argv": job.argv,
+            "started_at": job.started_at, "finished_at": job.finished_at,
+            "returncode": job.returncode, "lines": job.lines[-JOURNAL_LINES:],
+        }
+        with self.lock:
+            self.runs.append(record)
+            self.runs = self.runs[-JOURNAL_KEEP:]
+            self._persist_journal()
 
     def status(self) -> dict[str, Any] | None:
         return self.current.snapshot() if self.current else None
+
+    def history(self) -> list[dict[str, Any]]:
+        """Compact list of finished runs, newest first (no output lines)."""
+        with self.lock:
+            runs = list(self.runs)
+        out = []
+        for row in reversed(runs):
+            out.append({
+                "id": row.get("id"), "label": row.get("label", ""),
+                "started_at": row.get("started_at"), "finished_at": row.get("finished_at"),
+                "returncode": row.get("returncode"),
+                "nlines": len(row.get("lines", [])),
+            })
+        return out
+
+    def run_output(self, run_id: str) -> dict[str, Any] | None:
+        """Full captured output for one run (finished journal entry or the live job)."""
+        if self.current and self.current.id == run_id:
+            return self.current.snapshot()
+        with self.lock:
+            for row in reversed(self.runs):
+                if row.get("id") == run_id:
+                    return {**row, "running": False}
+        return None
 
     def stop(self) -> bool:
         with self.lock:
@@ -365,7 +441,7 @@ class AdminApp:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.root = config.root
-        self.runner = JobRunner(self.root)
+        self.runner = JobRunner(self.root, config.data_dir / "jobs.jsonl")
         self.settings_path = config.data_dir / "admin-settings.json"
         self._balance_cache: tuple[float, float | None] = (0.0, None)  # (fetched_at, rub)
         self._resume_cache: dict[str, Any] = {}  # last-known HH resume titles
@@ -460,30 +536,47 @@ class AdminApp:
             "tracks": {},
             "job": self.runner.status(),
         }
+        # The operator's per-vacancy state, so the dashboard reflects exactly the
+        # same "active" pool as the vacancies tab (handled ones drop off).
+        viewed = self._viewed()
+        bad = self._bad()
+        applied = self._manual_applied()
+        blocked = store.blocked_ids(account) if self.config.db_path.exists() else set()
+        today = _today()
         for track, cfg in TRACKS.items():
             profile = _profile_flag(self.root, track)
             report = _read_json(self.root / cfg["screen_report"]) or {}
             results = report.get("results", []) if isinstance(report, dict) else []
-            # Top-fit preview (deduplicated) for the dashboard.
-            today = _today()
+            # Annotate before dedup (mirrors vacancies()), so buckets agree.
             enriched = [{**r, "fresh": _is_fresh(r.get("published", "")),
                          "is_new": _is_new(r.get("first_seen", ""), today),
+                         "viewed": str(r.get("id", "")) in viewed,
+                         "bad": str(r.get("id", "")) in bad,
+                         "applied": str(r.get("id", "")) in applied,
+                         "blocked": str(r.get("id", "")) in blocked,
                          "exp_label": _exp_label(r.get("experience", ""))} for r in results]
             top = sorted(_dedup_rows(enriched),
                          key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
                                         -int(r.get("fit_score", 0) or 0)))
+            # "Active" = not handled (not viewed, not marked bad) — same as the
+            # vacancies tab's active bucket.
+            active = [r for r in top if not r.get("viewed") and not r.get("bad")]
+            # Suggestions worth acting on now: active FIT not yet applied/blocked.
             top_fit = [{"id": r.get("id"), "name": r.get("name"), "company": r.get("company"),
                         "url": r.get("url"), "fit_score": r.get("fit_score"),
                         "verdict": r.get("verdict"), "exp_label": r.get("exp_label"),
                         "fresh": r.get("fresh"), "is_new": r.get("is_new")}
-                       for r in top if r.get("verdict") == "FIT"][:6]
-            fresh_count = sum(1 for r in top if r.get("fresh")
+                       for r in active
+                       if r.get("verdict") == "FIT" and not r.get("applied")
+                       and not r.get("blocked")][:6]
+            fresh_count = sum(1 for r in active if r.get("fresh")
                               and r.get("verdict") in ("FIT", "MAYBE"))
-            new_count = sum(1 for r in top if r.get("is_new")
+            new_count = sum(1 for r in active if r.get("is_new")
                             and r.get("verdict") in ("FIT", "MAYBE"))
-            # Unique (deduplicated) counts so overview matches the vacancies view.
+            # Unique (deduplicated) counts over the active pool so the overview
+            # matches the vacancies view's active segment.
             uniq: dict[str, int] = {"FIT": 0, "MAYBE": 0, "SKIP": 0, "ERROR": 0}
-            for r in top:
+            for r in active:
                 uniq[r.get("verdict", "")] = uniq.get(r.get("verdict", ""), 0) + 1
             accepted = _read_json(self.root / cfg["accepted"]) or {}
             result["tracks"][track] = {
@@ -1108,6 +1201,12 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 self._send(200, app.vacancies(track))
             elif parsed.path == "/api/job":
                 self._send(200, app.runner.status() or {})
+            elif parsed.path == "/api/jobs":
+                self._send(200, {"current": app.runner.status(),
+                                 "history": app.runner.history()})
+            elif parsed.path == "/api/job-output":
+                run_id = parse_qs(parsed.query).get("id", [""])[0]
+                self._send(200, app.runner.run_output(run_id) or {})
             elif parsed.path == "/api/settings":
                 self._send(200, app.settings_public())
             elif parsed.path == "/api/stats":
@@ -1272,6 +1371,13 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 .modal h3{margin:0 0 6px;text-transform:none;font-size:16px;color:var(--fg)}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
+.logruns{display:flex;flex-direction:column;gap:3px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:6px;margin:10px 0}
+.logrun{display:flex;gap:10px;align-items:center;padding:6px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent;font-size:13px}
+.logrun:hover{background:#151b22}
+.logrun.sel{background:#223049;border-color:var(--accent)}
+.logrun .rl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.logrun .rt{color:var(--mut);font-size:12px;white-space:nowrap}
+.rc-ok{color:var(--fit)}.rc-err{color:var(--skip)}.rc-run{color:var(--accent)}
 </style></head><body>
 <header><h1>ApplyPilot</h1>
 <div class="tabs" id="tabs">
@@ -1343,8 +1449,10 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 
 <section id="log" class="hide">
   <div class="row"><span id="logmeta" class="muted"></span>
-    <button class="ghost mini" id="logrefresh" onclick="refreshJob()">Обновить</button>
+    <button class="ghost mini" id="logrefresh" onclick="logFollow=true;refreshJob()">К последней</button>
     <button class="danger mini" id="logstop" onclick="stopJob()">Стоп</button></div>
+  <div class="muted" style="font-size:12px;margin:2px 0 0">Журнал прогонов — каждая задача сохраняется отдельной строкой. Клик по строке открывает её вывод.</div>
+  <div id="logruns" class="logruns"></div>
   <pre id="logbox"></pre>
 </section>
 
@@ -1451,7 +1559,7 @@ function gotoApply(track){pendingApplyTrack=track;show("apply");}
 /* ---- jobs ---- */
 async function job(action,track){const body={action,track:track||"ai"};
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
 
 /* ---- vacancies ---- */
 let VSTATUS="active";
@@ -1551,7 +1659,7 @@ async function runApply(action){const track=$("#atrack").value;
   const body={action,track,mode:applyMode,limit:+$("#alimit").value||10,marked:[...marks()]};
   if(action==="apply_run"){if(!$("#aconfirm")||!$("#aconfirm").checked){alert("Отметь галку подтверждения");return;}body.confirm=true;}
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  if(!r.ok){alert("Не запущено: "+r.message);return;}show("log");refreshJob();}
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
 
 /* ---- stats ---- */
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
@@ -1567,14 +1675,42 @@ async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
 function bar(label,val,mx,color,unit){const w=Math.round(100*val/mx);return `<div class="row" style="gap:8px"><span class="muted" style="width:110px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:80px;text-align:right">${val}${unit||''}</span></div>`;}
 function seg(label,val,tot,color){const w=Math.round(100*val/tot);return `<div class="row" style="gap:8px"><span class="muted" style="width:72px">${label}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:44px;text-align:right">${val}</span></div>`;}
 
-/* ---- job log ---- */
-async function refreshJob(){const j=await api("/api/job");const has=!!j.label;
-  $("#logbox").textContent=(j.lines||[]).join("\\n")||(has?"":"Задач ещё не запускалось. Лог появится после «Проверить свежие», «Пересканировать», пробного запуска или отклика.");
-  $("#logmeta").innerHTML=has?(j.label+(j.running?' <span class="spin"></span> идёт':(" — завершено, код "+j.returncode))):'<span class="muted">нет активных задач</span>';
-  $("#logstop").disabled=!j.running;$("#logrefresh").disabled=!has;
-  const st=has?(j.label+(j.running?' ▶':' ✓')):"";$("#jobstate").textContent=st;
-  if(j.running){const b=$("#logbox");b.scrollTop=b.scrollHeight;}
-  return !!j.running;}
+/* ---- job log (journal) ---- */
+let logSel=null,logFollow=true;const logCache={};
+const JOB_LABELS={scan:"Скан",scan_screen:"Разобрать вакансии",fresh:"Свежие",screen:"Скрининг",
+  sync:"Синхронизация с HH",analytics:"Аналитика",apply_dry:"Пробный отклик",apply_run:"Реальные отклики"};
+function jobLabel(label){const[a,t]=String(label||"").split(":");return (JOB_LABELS[a]||a||"задача")+(t?" · "+t:"");}
+function ts(sec){if(!sec)return"";const d=new Date(sec*1000);return d.toLocaleString("ru-RU",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+function dur(a,b){if(!a||!b)return"";const s=Math.max(0,Math.round(b-a));return s<60?s+"с":Math.floor(s/60)+"м "+(s%60)+"с";}
+function runStatus(r){if(r.running)return['<span class="spin"></span>','rc-run','идёт'];
+  return r.returncode===0?['✓','rc-ok','код 0']:['✕','rc-err','код '+r.returncode];}
+async function refreshJob(){const d=await api("/api/jobs");const cur=d.current;const hist=d.history||[];
+  const running=!!(cur&&cur.running);
+  // Live entry sits on top of the journal; a finished current is already in history.
+  const entries=running?[{...cur,running:true},...hist]:hist;
+  if(running)logSel=cur.id;
+  else if(logFollow)logSel=(entries[0]&&entries[0].id)||null;
+  if(!entries.some(e=>e.id===logSel))logSel=(entries[0]&&entries[0].id)||null;
+  // render list
+  $("#logruns").innerHTML=entries.length?entries.map(r=>{const[ic,cl,txt]=runStatus(r);
+    return `<div class="logrun ${r.id===logSel?'sel':''}" onclick="selectRun('${r.id}')">`
+      +`<span class="${cl}">${ic}</span><span class="rl">${esc(jobLabel(r.label))}</span>`
+      +`<span class="rt">${ts(r.started_at)}${r.finished_at?' · '+dur(r.started_at,r.finished_at):''} · ${txt}</span></div>`;}).join("")
+    :'<div class="muted" style="padding:8px">Задач ещё не запускалось. Журнал появится после «Разобрать вакансии», скрининга, пробного запуска или отклика.</div>';
+  // output for selected run
+  await showRunOutput(logSel,running&&logSel===cur.id?cur:null);
+  const sel=entries.find(e=>e.id===logSel);
+  $("#logmeta").innerHTML=sel?(`<b>${esc(jobLabel(sel.label))}</b> — `+(sel.running?'<span class="spin"></span> идёт':('завершено ('+runStatus(sel)[2]+')'))):'<span class="muted">нет задач</span>';
+  $("#logstop").disabled=!running;
+  $("#jobstate").textContent=running?(jobLabel(cur.label)+' ▶'):(hist[0]?jobLabel(hist[0].label)+' ✓':"");
+  return running;}
+async function showRunOutput(id,liveJob){const box=$("#logbox");
+  if(!id){box.textContent="";return;}
+  if(liveJob){box.textContent=(liveJob.lines||[]).join("\\n");box.scrollTop=box.scrollHeight;return;}
+  if(logCache[id]){box.textContent=logCache[id].join("\\n");return;}
+  const o=await api("/api/job-output?id="+encodeURIComponent(id));const lines=o.lines||[];
+  logCache[id]=lines;box.textContent=lines.join("\\n");}
+function selectRun(id){logSel=id;logFollow=false;refreshJob();}
 async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
 
 /* ---- tracks + watch ---- */
