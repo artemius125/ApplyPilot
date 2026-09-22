@@ -26,7 +26,14 @@ from .config import (
 from .cover_letters import letter_mode, load_letter_profile, render_template
 from .llm import generate
 from .pacing import next_delay
-from .parser import ScanSegment, enrich_items, load_items, save_snapshot, scan_many
+from .parser import (
+    ScanSegment,
+    enrich_items,
+    load_items,
+    save_snapshot,
+    scan_many,
+    stamp_first_seen,
+)
 from .presets import ROLE_PRESETS
 from .quality import run_benchmark
 from .review import write_review
@@ -410,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
             status = "truncated"
         else:
             status = "ok" if all_items else "empty"
+        # Record when each vacancy was first discovered so the UI can tell a
+        # brand-new vacancy from one carried over from an earlier scan.
+        stamp_first_seen(all_items, config.data_dir / "seen.json")
         path = save_snapshot(all_items, config.snapshots_dir, " | ".join(queries), status,
                              "\n".join(errors), segments, args.preset or search.get("preset"))
         print(f"status: {status}; items: {len(all_items)}; segments: {len(segments)}; snapshot: {path}")

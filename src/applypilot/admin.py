@@ -294,6 +294,29 @@ def _is_fresh(published: str, *, days: int = 3) -> bool:
         return False
 
 
+def _today() -> str:
+    from datetime import UTC, datetime
+    return datetime.now(UTC).date().isoformat()
+
+
+def _found_label(first_seen: str) -> str:
+    """Compact 'found on' date (e.g. '22.09'), '—' when unknown."""
+    text = str(first_seen or "").strip()[:10]
+    if not text:
+        return "—"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(text).strftime("%d.%m")
+    except (ValueError, TypeError):
+        return text
+
+
+def _is_new(first_seen: str, today: str | None = None) -> bool:
+    """True when the vacancy was first discovered today (this scan cycle)."""
+    text = str(first_seen or "").strip()[:10]
+    return bool(text) and text == (today or _today())
+
+
 def _norm_title(name: str) -> str:
     """Normalise a vacancy title for near-duplicate collapsing."""
     text = str(name or "").lower().strip()
@@ -329,6 +352,11 @@ def _dedup_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         best = dict(members[0])
         best["dupes"] = len(members) - 1
         best["dupe_ids"] = [str(m.get("id", "")) for m in members[1:]]
+        # A repost gets a fresh id, so the earliest first_seen across the group
+        # is the vacancy's true discovery date.
+        seens = [str(m.get("first_seen") or "") for m in members if str(m.get("first_seen") or "")]
+        if seens:
+            best["first_seen"] = min(seens)
         collapsed.append(best)
     return collapsed
 
@@ -437,7 +465,9 @@ class AdminApp:
             report = _read_json(self.root / cfg["screen_report"]) or {}
             results = report.get("results", []) if isinstance(report, dict) else []
             # Top-fit preview (deduplicated) for the dashboard.
+            today = _today()
             enriched = [{**r, "fresh": _is_fresh(r.get("published", "")),
+                         "is_new": _is_new(r.get("first_seen", ""), today),
                          "exp_label": _exp_label(r.get("experience", ""))} for r in results]
             top = sorted(_dedup_rows(enriched),
                          key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
@@ -445,10 +475,12 @@ class AdminApp:
             top_fit = [{"id": r.get("id"), "name": r.get("name"), "company": r.get("company"),
                         "url": r.get("url"), "fit_score": r.get("fit_score"),
                         "verdict": r.get("verdict"), "exp_label": r.get("exp_label"),
-                        "fresh": r.get("fresh")}
+                        "fresh": r.get("fresh"), "is_new": r.get("is_new")}
                        for r in top if r.get("verdict") == "FIT"][:6]
             fresh_count = sum(1 for r in top if r.get("fresh")
                               and r.get("verdict") in ("FIT", "MAYBE"))
+            new_count = sum(1 for r in top if r.get("is_new")
+                            and r.get("verdict") in ("FIT", "MAYBE"))
             # Unique (deduplicated) counts so overview matches the vacancies view.
             uniq: dict[str, int] = {"FIT": 0, "MAYBE": 0, "SKIP": 0, "ERROR": 0}
             for r in top:
@@ -463,6 +495,7 @@ class AdminApp:
                 "has_report": bool(report),
                 "top_fit": top_fit,
                 "fresh_count": fresh_count,
+                "new_count": new_count,
             }
         return result
 
@@ -535,6 +568,10 @@ class AdminApp:
                 "fresh": _is_fresh(row.get("published", "")),
             })
         rows = _dedup_rows(rows)
+        today = _today()
+        for r in rows:
+            r["found_label"] = _found_label(r.get("first_seen", ""))
+            r["is_new"] = _is_new(r.get("first_seen", ""), today)
         rows.sort(key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
                                  -int(r.get("fit_score", 0) or 0)))
         folded = sum(int(r.get("dupes", 0)) for r in rows)
@@ -1188,6 +1225,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 .muted{color:var(--mut)}.hide{display:none}.hl{color:var(--warn)}
 .badge{font-size:11px;padding:1px 7px;border-radius:6px;background:var(--card2);border:1px solid var(--line);color:var(--mut);margin-left:6px;white-space:nowrap;display:inline-block}
 .fresh{color:var(--fit);border-color:rgba(47,191,113,.4)}
+.new{color:var(--star);border-color:rgba(255,210,63,.45)}
 .applied{color:var(--accent);border-color:rgba(76,141,255,.4)}
 .star{cursor:pointer;font-size:17px;color:#3a434f;user-select:none}.star.on{color:var(--star)}
 .tf{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
@@ -1359,7 +1397,7 @@ async function loadOverview(){const d=await api("/api/overview");
   h+='</div><div class="grid two" style="margin-top:12px">';
   for(const k in d.tracks){const t=d.tracks[k];const c=t.counts_unique||t.counts||{};
     h+=`<div class="card"><div class="row" style="justify-content:space-between;margin:0"><h3 style="margin:0">${esc(t.label)}</h3>`
-      +(t.fresh_count?`<span class="badge fresh">🟢 свежих ${t.fresh_count}</span>`:"")+`</div>`
+      +(t.new_count?`<span class="badge new">🆕 новых ${t.new_count}</span>`:"")+(t.fresh_count?`<span class="badge fresh">🟢 свежих ${t.fresh_count}</span>`:"")+`</div>`
       +`<div class="big" style="margin:8px 0">${(c.FIT||0)} <span class="muted" style="font-size:13px">подходящих (FIT)</span></div>`
       +`<div class="row" style="gap:6px;margin:0 0 8px"><span class="pill FIT">FIT ${c.FIT??0}</span><span class="pill MAYBE">MAYBE ${c.MAYBE??0}</span><span class="pill SKIP">SKIP ${c.SKIP??0}</span>${c.ERROR?`<span class="pill ERROR">ERR ${c.ERROR}</span>`:""}</div>`
       +(t.reviewed?'<div class="badge fresh" style="margin:0 0 8px">профиль проверен — реальные отклики разрешены</div>':'<div class="badge" style="margin:0 0 8px;color:var(--warn)">профиль не проверен → реальные отклики заблокированы</div>')
@@ -1368,7 +1406,7 @@ async function loadOverview(){const d=await api("/api/overview");
       +`<button class="ghost mini" onclick="job('fresh','${k}')">Проверить свежие</button></div>`;
     if((t.top_fit||[]).length){h+='<div style="margin-top:12px">';
       for(const f of t.top_fit){h+=`<div class="tf"><div><a href="${f.url}" target="_blank">${esc(f.name)}</a>`
-        +(f.fresh?'<span class="badge fresh">свежая</span>':"")+`<div class="muted">${esc(f.company||"")} · ${esc(f.exp_label||"")}</div></div>`
+        +(f.is_new?'<span class="badge new">новая</span>':"")+(f.fresh?'<span class="badge fresh">свежая</span>':"")+`<div class="muted">${esc(f.company||"")} · ${esc(f.exp_label||"")}</div></div>`
         +`<div style="text-align:right;white-space:nowrap"><span class="pill FIT">${f.fit_score}</span><br>`
         +`<button class="ghost mini" style="margin-top:4px" onclick="genLetter('${k}','${f.id}','${encodeURIComponent(f.url||"")}')">Письмо</button></div></div>`;}
       h+='</div>';}
@@ -1410,10 +1448,10 @@ async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
   const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
   const exportBtn=VSTATUS==="bad"?` <button class="ghost mini" onclick="exportBad()">Выгрузить в текст (.md)</button>`:"";
   $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length}${dup}${exportBtn}`;
-  let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
+  let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th class="nowrap">Найдена</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
   for(const r of rows){const id=String(r.id);const on=mk.has(id);
     const expc=r.over_experience?' class="hl nowrap"':' class="nowrap"';
-    const badges=(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"")
+    const badges=(r.is_new?'<span class="badge new">новая</span>':"")+(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${r.dupes}</span>`:"")
       +(r.applied?'<span class="badge applied">откликнулся</span>':"")+(r.viewed?'<span class="badge">просмотрено</span>':"")+(r.bad?'<span class="badge" style="color:var(--skip)">плохая</span>':"");
     const status=r.blocked?'<span class="muted">откликался</span>':(r.applied?'<span class="muted">отмечен</span>':esc(r.db_status||""));
     const badBtn=r.bad?`<button class="ghost mini" onclick="markBad('${id}',false)">вернуть</button>`
@@ -1423,6 +1461,7 @@ async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
       <td class="nowrap">${r.fit_score??""}</td>
       <td${expc} title="${r.over_experience?'требуемый опыт выше твоего':''}">${esc(r.exp_label||"—")}</td>
       <td class="muted nowrap">${esc(r.salary_label||"—")}</td>
+      <td class="${r.is_new?'':'muted '}nowrap" title="${esc(r.first_seen||'')}">${esc(r.found_label||"—")}</td>
       <td><a href="${r.url}" target="_blank" onclick="markViewed('${id}')">${esc(r.name)}</a>${badges}<div class="muted">${esc(r.company||"")}</div></td>
       <td class="reason">${esc(r.reason||"")}</td>
       <td class="nowrap">${status}</td>

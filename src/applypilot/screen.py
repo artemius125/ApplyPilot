@@ -309,7 +309,8 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
                 "score": int(item.get("score", 0) or 0),
                 "experience": item.get("experience", ""), "salary": item.get("salary"),
                 "area": item.get("area", ""), "schedule": item.get("schedule", ""),
-                "published": item.get("published", "")}
+                "published": item.get("published", ""),
+                "first_seen": item.get("first_seen", "")}
         path = cache_dir / f"screen-{screen_cache_key(item, candidate, model, track, rubric)}.json"
         if path.exists():
             try:

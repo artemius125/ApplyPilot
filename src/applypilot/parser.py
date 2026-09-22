@@ -383,6 +383,50 @@ def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
     return path
 
 
+def stamp_first_seen(items: list[dict[str, Any]], registry_path: Path,
+                     today: str | None = None) -> list[dict[str, Any]]:
+    """Attach and persist the date each vacancy id was first seen by a scan.
+
+    A small ``id -> YYYY-MM-DD`` registry is kept next to the data so a vacancy
+    keeps its original discovery date across scans, while genuinely new ids get
+    today's date.  Each item gains ``first_seen`` (the recorded date) and
+    ``is_new`` (True when that date is today), which lets the UI tell an
+    unseen-before vacancy from one that was already in a previous scan.
+    """
+    today = today or datetime.now(UTC).date().isoformat()
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        if not isinstance(registry, dict):
+            registry = {}
+    except (OSError, json.JSONDecodeError):
+        registry = {}
+    changed = False
+    for item in items:
+        vacancy_id = str(item.get("id") or "")
+        if not vacancy_id:
+            continue
+        seen = str(registry.get(vacancy_id) or "")
+        if not seen:
+            seen = today
+            registry[vacancy_id] = seen
+            changed = True
+        item["first_seen"] = seen
+        item["is_new"] = seen == today
+    if changed:
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".seen-", dir=registry_path.parent, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(registry, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_name, registry_path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+    return items
+
+
 def load_items(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, list) else list(payload.get("items", []))
