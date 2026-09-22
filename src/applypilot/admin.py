@@ -635,6 +635,31 @@ class AdminApp:
                           + " ".join(shlex.quote(x) for x in screen_extra))
             argv = ["bash", "-lc", f"set -e; {scan_cmd}; {screen_cmd}"]
             return self.runner.start(argv, f"fresh:{track}", env=self._screen_env())
+        elif action == "scan_screen":
+            # One click = full scan of this track, then LLM screening of the
+            # result, streamed as a single job.  Never applies.
+            if not self._api_key():
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
+            import shlex
+            s = self.load_settings()
+            screen_extra = ["--track", cfg["type"], "--output", cfg["screen_report"],
+                            "--emit-snapshot", cfg["accepted"]]
+            if str(s.get("model") or "").strip():
+                screen_extra += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                screen_extra += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                screen_extra += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                screen_extra += ["--criteria", str(s[f"criteria_{track}"])]
+            py = shlex.quote(sys.executable)
+            g = " ".join(shlex.quote(x) for x in gflags)
+            scan_cmd = f"{py} -m applypilot {g} scan"
+            snap = "$(ls -t private/data/snapshots/hh_vacancies_*.json | head -1)"
+            screen_cmd = (f"{py} -m applypilot {g} screen --input {snap} "
+                          + " ".join(shlex.quote(x) for x in screen_extra))
+            argv = ["bash", "-lc", f"set -e; {scan_cmd}; {screen_cmd}"]
+            return self.runner.start(argv, f"scan_screen:{track}", env=self._screen_env())
         elif action == "analytics":
             argv = base + ["analytics"]
         elif action in {"apply_dry", "apply_run"}:
@@ -1401,9 +1426,10 @@ async function loadOverview(){const d=await api("/api/overview");
       +`<div class="big" style="margin:8px 0">${(c.FIT||0)} <span class="muted" style="font-size:13px">подходящих (FIT)</span></div>`
       +`<div class="row" style="gap:6px;margin:0 0 8px"><span class="pill FIT">FIT ${c.FIT??0}</span><span class="pill MAYBE">MAYBE ${c.MAYBE??0}</span><span class="pill SKIP">SKIP ${c.SKIP??0}</span>${c.ERROR?`<span class="pill ERROR">ERR ${c.ERROR}</span>`:""}</div>`
       +(t.reviewed?'<div class="badge fresh" style="margin:0 0 8px">профиль проверен — реальные отклики разрешены</div>':'<div class="badge" style="margin:0 0 8px;color:var(--warn)">профиль не проверен → реальные отклики заблокированы</div>')
-      +`<div class="row" style="margin:0"><button class="mini" onclick="gotoVac('${k}','FIT')">Показать FIT →</button>`
+      +`<div class="row" style="margin:0"><button class="mini" onclick="job('scan_screen','${k}')" title="Полный скан HH + LLM-скрининг за один клик">Разобрать вакансии</button>`
+      +`<button class="ghost mini" onclick="gotoVac('${k}','FIT')">Показать FIT →</button>`
       +`<button class="ghost mini" onclick="gotoApply('${k}')">Откликнуться</button>`
-      +`<button class="ghost mini" onclick="job('fresh','${k}')">Проверить свежие</button></div>`;
+      +`<button class="ghost mini" onclick="job('fresh','${k}')">Только свежие</button></div>`;
     if((t.top_fit||[]).length){h+='<div style="margin-top:12px">';
       for(const f of t.top_fit){h+=`<div class="tf"><div><a href="${f.url}" target="_blank">${esc(f.name)}</a>`
         +(f.is_new?'<span class="badge new">новая</span>':"")+(f.fresh?'<span class="badge fresh">свежая</span>':"")+`<div class="muted">${esc(f.company||"")} · ${esc(f.exp_label||"")}</div></div>`
