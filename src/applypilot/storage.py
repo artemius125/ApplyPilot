@@ -144,6 +144,27 @@ class Store:
         finally:
             conn.close()
 
+    def journaled_vacancy_ids(self) -> set[str]:
+        """Read every vacancy ID ever written to the application journal."""
+        if not self.path.exists():
+            return set()
+        uri = f"file:{self.path.resolve()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            return set()
+        try:
+            found: set[str] = set()
+            for table in ("attempts", "events", "run_items", "negotiation_statuses"):
+                try:
+                    found.update(str(row[0]) for row in conn.execute(
+                        f"SELECT DISTINCT vacancy_id FROM {table}") if row[0])
+                except sqlite3.Error:
+                    continue
+            return found
+        finally:
+            conn.close()
+
     def import_csv(self, path: Path, account: str = "default") -> ImportReport:
         """Import one legacy CSV exactly once per account and source digest."""
         with path.open("rb") as fh:

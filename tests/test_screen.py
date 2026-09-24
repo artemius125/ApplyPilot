@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from applypilot.screen import ScreenError, parse_verdict, screen_vacancies
+from applypilot.cli import main
 
 
 def test_parse_verdict_plain():
@@ -66,3 +69,24 @@ def test_screen_requires_key(tmp_path):
     with pytest.raises(ScreenError):
         screen_vacancies([{"id": "1", "description": "x"}], {"answers": {}}, tmp_path,
                          api_key="", post=lambda *a, **k: None)
+
+
+def test_cli_screen_skips_vacancies_in_any_existing_screen_report(tmp_path, monkeypatch):
+    data = tmp_path / "private" / "data"
+    reports = tmp_path / "private" / "reports"
+    reports.mkdir(parents=True)
+    (reports / "screen-infra.json").write_text(json.dumps({
+        "results": [{"id": "1", "verdict": "SKIP"}],
+    }), encoding="utf-8")
+    source = tmp_path / "scan.json"
+    source.write_text(json.dumps({"items": [{
+        "id": "1", "name": "AI Agent Engineer", "description": "Python LLM RAG",
+    }]}), encoding="utf-8")
+    screened = []
+    monkeypatch.setattr("applypilot.cli.screen_vacancies",
+                        lambda items, *args, **kwargs: screened.extend(items) or [])
+
+    result = main(["--data-dir", str(data), "screen", "--input", str(source)])
+
+    assert result == 0
+    assert screened == []

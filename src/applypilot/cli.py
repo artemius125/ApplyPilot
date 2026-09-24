@@ -33,6 +33,7 @@ from .parser import (
     save_snapshot,
     scan_many,
     stamp_first_seen,
+    journaled_vacancy_ids,
 )
 from .presets import ROLE_PRESETS
 from .quality import run_benchmark
@@ -295,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
     if args.command == "scan":
+        journaled_ids = (journaled_vacancy_ids(config.data_dir)
+                         | Store(config.db_path).journaled_vacancy_ids())
         raw_search = config.load_search()
         try:
             search = effective_search(raw_search, args.preset)
@@ -386,6 +389,11 @@ def main(argv: list[str] | None = None) -> int:
             existing["search_groups"] = sorted(set(existing.get("search_groups", [existing.get("search_group", "")]))
                                                | {item.get("search_group", "")})
         all_items = list(deduplicated.values())
+        # Repeated HH results are dropped before requesting vacancy descriptions.
+        all_items = [item for item in all_items
+                     if str(item.get("id", "")) not in journaled_ids]
+        for item in all_items:
+            item["new_to_search"] = True
         group_by_name = {str(group.get("group_name") or "default"): group for group in groups}
         details_limit = (args.details_limit if args.details_limit is not None
                          else int(search.get("details_limit", 100)))
@@ -622,6 +630,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "screen":
         raw_items = load_items(args.input)
+        # Exclude previously journaled vacancies before candidate selection or LLM calls.
+        artifact_history = journaled_vacancy_ids(
+            config.data_dir,
+            exclude_paths=(args.input,),
+            include_registry=False,
+        )
+        application_history = Store(config.db_path).journaled_vacancy_ids()
+        registry_history = (journaled_vacancy_ids(
+            config.data_dir, exclude_paths=(args.input,), include_registry=True,
+        ) - artifact_history - application_history)
+        raw_items = [item for item in raw_items
+                     if str(item.get("id", "")) not in artifact_history
+                     and str(item.get("id", "")) not in application_history
+                     and (str(item.get("id", "")) not in registry_history
+                          or item.get("new_to_search") is True)]
         try:
             search = effective_search(config.load_search(), args.preset)
         except ConfigError as exc:

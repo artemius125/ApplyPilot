@@ -93,6 +93,26 @@ queries = ["Python"]
     assert sum(segment["requests"] for segment in snapshot["segments"]) == 2
 
 
+def test_scan_drops_vacancies_already_in_seen_registry(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("applypilot.parser.time.sleep", lambda _: None)
+    monkeypatch.setattr("applypilot.parser.requests.Session", lambda: Client([Response()]))
+    search = tmp_path / "search.toml"
+    search.write_text('''queries = ["Go"]
+details_limit = 0
+''', encoding="utf-8")
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "seen.json").write_text('{"1":"2026-09-20"}', encoding="utf-8")
+
+    result = main(["--search", str(search), "--data-dir", str(data), "scan"])
+
+    assert result == 0
+    snapshot = json.loads(next((data / "snapshots").glob("hh_vacancies_*.json")).read_text())
+    assert snapshot["items"] == []
+    assert snapshot["status"] == "empty"
+
+
 @pytest.mark.parametrize("allowed", [None, ["moreThan6"]])
 def test_senior_experience_can_be_selected(allowed):
     search = {"role_terms": ["go"], "primary_role_terms": ["go"]}

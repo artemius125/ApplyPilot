@@ -427,6 +427,42 @@ def stamp_first_seen(items: list[dict[str, Any]], registry_path: Path,
     return items
 
 
+def journaled_vacancy_ids(data_dir: Path, *, exclude_paths: Iterable[Path] = (),
+                          include_registry: bool = True) -> set[str]:
+    """Return vacancy IDs already present in scan history or screening journals."""
+    excluded = {path.resolve() for path in exclude_paths}
+    paths: set[Path] = set()
+    snapshots = data_dir / "snapshots"
+    reports = {data_dir / "reports", data_dir.parent / "reports"}
+    if snapshots.exists():
+        paths.update(snapshots.glob("*.json"))
+    for directory in reports:
+        if directory.exists():
+            paths.update(directory.glob("*.json"))
+    if include_registry:
+        paths.add(data_dir / "seen.json")
+
+    found: set[str] = set()
+    for path in paths:
+        if path.resolve() in excluded:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if path.name == "seen.json" and isinstance(payload, dict):
+            found.update(str(value) for value in payload if str(value))
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for collection in (payload.get("items"), payload.get("results")):
+            if isinstance(collection, list):
+                found.update(str(item.get("id") or item.get("vacancyId") or "")
+                             for item in collection if isinstance(item, dict)
+                             and (item.get("id") or item.get("vacancyId")))
+    return found
+
+
 def load_items(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, list) else list(payload.get("items", []))
